@@ -10,3 +10,6 @@ slack-sdk
 aiohttp
 db-dtypes
 cachetools
+google-cloud-aiplatform
+cachetools
+python-dotenv
