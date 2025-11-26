@@ -8,6 +8,10 @@ import hashlib
 import time
 from functools import lru_cache
 import os
+from typing import Optional
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Конфіг BigQuery (із дефолтами під ваш проект/датасет/таблиці)
@@ -192,11 +196,15 @@ def split_into_separate_queries(message: str) -> list:
 # ──────────────────────────────────────────────────────────────────────────────
 # 7) Генерація та виконання одного запиту
 # ──────────────────────────────────────────────────────────────────────────────
-def execute_single_query(instruction: str, smap: dict) -> str:
+def execute_single_query(instruction: str, smap: dict, user_id: Optional[str] = None) -> str:
     try:
         instruction_part = instruction.strip()
         if not instruction_part:
             return "Повідомлення порожнє. Напиши інструкцію."
+
+        # Лог корисний для діагностики
+        if user_id:
+            logging.info(f"[execute_single_query] user_id={user_id}, instruction={instruction_part}")
 
         matched_conditions = find_matches_with_ai(instruction_part, smap)
         for field, value in matched_conditions:
@@ -281,20 +289,25 @@ CSV результат SQL:
         return f"Помилка під час обробки:\n{str(e)}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8) Обробка складних повідомлень і фінальний висновок (без змін по суті)
+# 8) Обробка складних повідомлень і фінальний висновок
 # ──────────────────────────────────────────────────────────────────────────────
-def process_slack_message(message: str, smap: dict) -> str:
+def process_slack_message(message: str, smap: dict, user_id: Optional[str] = None) -> str:
     try:
         if not message.strip():
             return "Повідомлення порожнє. Напиши інструкцію."
+
+        if user_id:
+            logging.info(f"[process_slack_message] user_id={user_id}, message={message}")
+
         queries = split_into_separate_queries(message)
+
         if len(queries) == 1:
-            return execute_single_query(queries[0], smap)
+            return execute_single_query(queries[0], smap, user_id)
 
         results = []
         for i, q in enumerate(queries, 1):
-            print(f"Виконання запиту {i}/{len(queries)}: {q}")
-            results.append((i, q, execute_single_query(q, smap)))
+            logging.info(f"Виконання запиту {i}/{len(queries)}: {q} (user_id={user_id})")
+            results.append((i, q, execute_single_query(q, smap, user_id)))
 
         final = f"📝 **Знайдено {len(queries)} запитів. Відповідаю на кожен:**\n\n"
         for i, q, r in results:
