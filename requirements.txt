@@ -9,3 +9,4 @@ rapidfuzz
 slack-sdk
 aiohttp
 db-dtypes
+cachetools
