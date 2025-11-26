@@ -1,0 +1,11 @@
+google-cloud-bigquery
+google-cloud-aiplatform
+python-dotenv
+pandas
+sentence-transformers
+fastapi
+uvicorn
+rapidfuzz
+slack-sdk
+aiohttp
+db-dtypes
