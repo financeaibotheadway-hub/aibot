@@ -1,15 +1,20 @@
 steps:
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'us-central1-docker.pkg.dev/thermal-beach-465608-h7/slack-bot-repo/slack-vertex-bot', '.']
+    args: ['build', '-t', 'europe-west1-docker.pkg.dev/finance-ai-bot-headway/aibot-repo/aibot:latest', '.']
 
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'us-central1-docker.pkg.dev/thermal-beach-465608-h7/slack-bot-repo/slack-vertex-bot']
+    args: ['push', 'europe-west1-docker.pkg.dev/finance-ai-bot-headway/aibot-repo/aibot:latest']
 
   - name: 'gcr.io/cloud-builders/gcloud'
-    args: [
-      'run', 'deploy', 'slack-vertex-bot',
-      '--image', 'us-central1-docker.pkg.dev/thermal-beach-465608-h7/slack-bot-repo/slack-vertex-bot',
-      '--platform', 'managed',
-      '--region', 'us-central1',
-      '--allow-unauthenticated'
-    ]
+    args:
+      [
+        'run','deploy','aibot',
+        '--image','europe-west1-docker.pkg.dev/finance-ai-bot-headway/aibot-repo/aibot:latest',
+        '--region','europe-west1',
+        '--platform','managed',
+        '--allow-unauthenticated',
+        '--memory','1Gi',
+        '--timeout','900',
+        '--max-instances','1'
+      ]
+timeout: '1800s'
