@@ -27,6 +27,7 @@ BQ_DATASET       = os.getenv("BQ_DATASET", "uploads")
 BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
 VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
+LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")     # >>> додаємо TZ для дат
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -90,6 +91,66 @@ def get_all_schemas():
 
 # попередньо ініціалізуй (корисно для першого промпта)
 _ = get_all_schemas()
+
+# >>> утиліти для дат
+def _collect_date_columns(schema_list):
+    """Повертає множину полів, які мають DATE/DATETIME/TIMESTAMP (щоб їх не парсили як STRING)."""
+    return {
+        f["name"]
+        for f in schema_list
+        if f.get("type") in ("DATE", "DATETIME", "TIMESTAMP")
+    }
+
+def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
+    """
+    Пост-обробка SQL: прибирає PARSE_DATE(..., <date_col>) та SAFE.PARSE_DATE для відомих DATE-полів,
+    підставляє CURRENT_DATE('<tz>') якщо без TZ.
+    """
+    original = sql_query
+
+    # 1) CURRENT_DATE() / CURRENT_DATE  → CURRENT_DATE('Europe/Kyiv')
+    #    (не чіпає, якщо TZ уже заданий)
+    sql_query = re.sub(
+        r"\bCURRENT_DATE\s*\(\s*\)",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+    sql_query = re.sub(
+        r"\bCURRENT_DATE\b(?!\s*\()",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
+    # 2) Для кожного відомого DATE-поля прибираємо PARSE_DATE('%Y-%m-%d', col) -> col
+    for col in sorted(date_columns, key=len, reverse=True):
+        # з іменами-аліасами типу t.posting_date або `posting_date`
+        pattern_plain = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+        def _repl_plain(m):
+            inner = m.group(1)
+            # повністю збігається з колоною (або з суфіксом .col)
+            inner_clean = inner.strip("`")
+            if inner_clean.endswith(f".{col}") or inner_clean == col:
+                return inner
+            return m.group(0)
+        sql_query = re.sub(pattern_plain, _repl_plain, sql_query, flags=re.IGNORECASE)
+
+        # SAFE.PARSE_DATE(...) -> CAST(col AS DATE)
+        pattern_safe = rf"SAFE\.PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+        def _repl_safe(m):
+            inner = m.group(1)
+            inner_clean = inner.strip("`")
+            if inner_clean.endswith(f".{col}") or inner_clean == col:
+                return f"CAST({inner} AS DATE)"
+            return m.group(0)
+        sql_query = re.sub(pattern_safe, _repl_safe, sql_query, flags=re.IGNORECASE)
+
+    if sql_query != original:
+        logger.info("[sanitize] SQL was sanitized for date handling")
+
+    return sql_query
+# <<< кінець утиліт
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BQ EXECUTOR (with logging)
@@ -248,6 +309,11 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         rev_schema, cost_schema = get_all_schemas()
 
+        # >>> зберемо відомі DATE-поля (щоб не парсити їх як STRING)
+        date_cols = _collect_date_columns(rev_schema) | _collect_date_columns(cost_schema)
+        date_cols_list = sorted(list(date_cols))
+        # <<<
+
         sql_prompt = f"""
 В нас є ДВІ таблиці в BigQuery:
 
@@ -270,12 +336,20 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 - Для ROAS/прибутку — агрегуй окремо та JOIN.
 - У REVENUE для «net revenue» — сумуй gross_usd (усі event_type).
 - period (12M/1M/6M) — це тип підписки, не час.
+- **Часовий пояс** для відносних дат: CURRENT_DATE('{LOCAL_TZ}').
+- **Важливо**: поля типу DATE/DATETIME/TIMESTAMP не треба парсити як STRING.
+  У цих таблицях поля дат: {date_cols_list}. Порівнюй їх без PARSE_DATE.
+  Наприклад, "вчора": posting_date = DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL 1 DAY).
 - Поверни лише фінальний SQL без пояснень.
 """
         response = model.generate_content(sql_prompt, generation_config={"temperature": 0})
         sql_query = response.text.strip().replace("```sql", "").replace("```", "").strip()
         if sql_query.lower().startswith("sql"):
             sql_query = sql_query[3:].strip()
+
+        # >>> пост-обробка SQL (прибрати PARSE_DATE на DATE-полях, додати TZ)
+        sql_query = _sanitize_sql_dates(sql_query, date_cols)
+        # <<<
 
         errs = validate_sql_syntax(sql_query)
         logger.debug("[execute_single_query] generated SQL:\n%s", sql_query)
