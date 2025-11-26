@@ -1,0 +1,15 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/thermal-beach-465608-h7/slack-bot-repo/slack-vertex-bot', '.']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/thermal-beach-465608-h7/slack-bot-repo/slack-vertex-bot']
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args: [
+      'run', 'deploy', 'slack-vertex-bot',
+      '--image', 'us-central1-docker.pkg.dev/thermal-beach-465608-h7/slack-bot-repo/slack-vertex-bot',
+      '--platform', 'managed',
+      '--region', 'us-central1',
+      '--allow-unauthenticated'
+    ]
