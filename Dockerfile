@@ -1,4 +1,7 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
@@ -7,6 +10,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-
-# ✅ Запускаємо main.py, який читає змінну PORT
+# стартуємо main.py (він читає PORT з env)
 CMD ["python", "main.py"]
