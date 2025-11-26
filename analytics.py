@@ -1,50 +1,72 @@
-from google.cloud import bigquery
-from vertexai.preview.generative_models import GenerativeModel
-import json
-from semantic_map import semantic_map
-import pandas as pd
-import re
-import hashlib
-import time
-from functools import lru_cache
-import os
-from typing import Optional
-import logging
+# analytics.py
+# -*- coding: utf-8 -*-
 
-logging.basicConfig(level=logging.INFO)
+import os
+import re
+import json
+import time
+import hashlib
+import logging
+import traceback
+from functools import lru_cache
+
+import pandas as pd
+from google.cloud import bigquery
+from google.api_core.exceptions import BadRequest, GoogleAPIError
+
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel
+
+from semantic_map import semantic_map  # якщо потрібно використати за замовчуванням
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Конфіг BigQuery (із дефолтами під ваш проект/датасет/таблиці)
+# ENV / LOGGING
 # ──────────────────────────────────────────────────────────────────────────────
 BQ_PROJECT       = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
 BQ_DATASET       = os.getenv("BQ_DATASET", "uploads")
 BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
+VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("ai-bot")
+
+# якщо TRUE — у відповідь у Slack додамо обрізаний SQL і текст помилки
+RETURN_SQL_ON_ERROR = os.getenv("RETURN_SQL_ON_ERROR", "false").lower() == "true"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INIT CLIENTS
+# ──────────────────────────────────────────────────────────────────────────────
 REVENUE_TABLE_REF = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_REVENUE_TABLE}"
 COST_TABLE_REF    = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_COST_TABLE}"
 
-# Ініціалізація клієнтів
+# BigQuery
 bq_client = bigquery.Client(project=BQ_PROJECT)
+
+# Vertex AI
+try:
+    vertexai.init(project=BQ_PROJECT, location=VERTEX_LOCATION)
+except Exception:
+    logger.warning("Vertex init failed; will rely on ambient creds", exc_info=True)
 model = GenerativeModel("gemini-2.5-flash")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2) Кеш для результатів запитів та схем
+# CACHE (SQL + schemas)
 # ──────────────────────────────────────────────────────────────────────────────
-query_cache = {}
-cache_ttl = 300  # 5 хвилин
+query_cache = {}  # key -> (df, ts)
+cache_ttl = 300   # seconds
 
-# кеш схем по кожній таблиці
-_schema_cache = {}   # {table_ref: [ {name,type}, ... ]}
-_schema_time  = {}   # {table_ref: unix_ts}
+_schema_cache = {}  # table_ref -> [{"name": ..., "type": ...}]
+_schema_time  = {}  # table_ref -> ts
 
 
 def get_cache_key(query: str) -> str:
-    return hashlib.md5(query.encode()).hexdigest()
+    return hashlib.md5(query.encode("utf-8")).hexdigest()
 
 
 def get_table_schema(table_ref: str, ttl_sec: int = 3600):
-    """Кешована схема конкретної таблиці."""
+    """Return cached schema for table."""
     now = time.time()
     if (
         table_ref not in _schema_cache
@@ -58,46 +80,60 @@ def get_table_schema(table_ref: str, ttl_sec: int = 3600):
 
 
 def get_all_schemas():
-    """Повертає обидві схеми для промпта."""
     rev_schema = get_table_schema(REVENUE_TABLE_REF)
     try:
         cost_schema = get_table_schema(COST_TABLE_REF)
     except Exception:
-        # якщо таблиці витрат поки немає — працюємо з однією
         cost_schema = []
     return rev_schema, cost_schema
 
 
-# Попередньо ініціалізуємо (щоб було що підставляти у промпт)
-schema_revenue, schema_cost = get_all_schemas()
+# попередньо ініціалізуй (корисно для першого промпта)
+_ = get_all_schemas()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3) Кешований виконувач SQL
+# BQ EXECUTOR (with logging)
 # ──────────────────────────────────────────────────────────────────────────────
-def execute_cached_query(sql_query):
+def execute_cached_query(sql_query: str):
     cache_key = get_cache_key(sql_query)
     now = time.time()
 
+    # cache HIT
     if cache_key in query_cache:
-        cached_df, ts = query_cache[cache_key]
+        df, ts = query_cache[cache_key]
         if now - ts < cache_ttl:
-            return cached_df
-        else:
-            del query_cache[cache_key]
+            logger.info("[bq] cache HIT key=%s age=%.1fs rows=%d", cache_key[:8], now - ts, len(df))
+            return df
 
-    df = bq_client.query(sql_query).result().to_dataframe()
-    query_cache[cache_key] = (df.copy(), now)
+    # cache MISS
+    logger.info("[bq] cache MISS key=%s", cache_key[:8])
+    start = time.perf_counter()
+    job = bq_client.query(sql_query)
 
-    # обмежуємо розмір кешу
-    if len(query_cache) > 20:
-        oldest_key = min(query_cache, key=lambda k: query_cache[k][1])
-        del query_cache[oldest_key]
-    return df
+    try:
+        df = job.result().to_dataframe()
+        took = time.perf_counter() - start
+        logger.info("[bq] OK job_id=%s rows=%d time=%.3fs", job.job_id, len(df), took)
+
+        query_cache[cache_key] = (df.copy(), now)
+        # trim cache
+        if len(query_cache) > 20:
+            oldest_key = min(query_cache, key=lambda k: query_cache[k][1])
+            del query_cache[oldest_key]
+        return df
+
+    except BadRequest as e:
+        msg = getattr(e, "message", str(e))
+        logger.exception("[bq] BadRequest job_id=%s : %s", getattr(job, "job_id", "?"), msg)
+        raise
+    except Exception:
+        logger.exception("[bq] FAILED job_id=%s", getattr(job, "job_id", "?"))
+        raise
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4) Валідатор SQL (легкі перевірки)
+# SQL SYNTAX VALIDATION (light checks)
 # ──────────────────────────────────────────────────────────────────────────────
-def validate_sql_syntax(sql_query):
+def validate_sql_syntax(sql_query: str):
     errors = []
 
     window_pattern = r'(?:ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD)\s*\(\s*\)\s+OVER\s*\([^)]*ORDER\s+BY\s+([^)]+)\)'
@@ -118,10 +154,10 @@ def validate_sql_syntax(sql_query):
     return errors
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5) AI-матчинг семантики (залишив як було)
+# AI matching
 # ──────────────────────────────────────────────────────────────────────────────
 @lru_cache(maxsize=100)
-def find_matches_with_ai_cached(instruction, semantic_map_str):
+def find_matches_with_ai_cached(instruction: str, semantic_map_str: str):
     smap = json.loads(semantic_map_str)
 
     context = {}
@@ -158,7 +194,7 @@ def find_matches_with_ai_cached(instruction, semantic_map_str):
                 field, value = pair.strip().split(':', 1)
                 matches.append((field, value))
         return matches
-    except:
+    except Exception:
         return []
 
 
@@ -166,7 +202,7 @@ def find_matches_with_ai(instruction, smap):
     return find_matches_with_ai_cached(instruction, json.dumps(smap, sort_keys=True))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6) Розділення складного повідомлення на окремі запити (залишив як було)
+# Split complex message
 # ──────────────────────────────────────────────────────────────────────────────
 def split_into_separate_queries(message: str) -> list:
     split_prompt = f"""
@@ -194,26 +230,24 @@ def split_into_separate_queries(message: str) -> list:
         return [message]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7) Генерація та виконання одного запиту
+# Main executors
 # ──────────────────────────────────────────────────────────────────────────────
-def execute_single_query(instruction: str, smap: dict, user_id: Optional[str] = None) -> str:
+def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown") -> str:
     try:
         instruction_part = instruction.strip()
         if not instruction_part:
             return "Повідомлення порожнє. Напиши інструкцію."
 
-        # Лог корисний для діагностики
-        if user_id:
-            logging.info(f"[execute_single_query] user_id={user_id}, instruction={instruction_part}")
+        logger.info("[execute_single_query] user_id=%s instruction=%s", user_id, instruction_part)
 
         matched_conditions = find_matches_with_ai(instruction_part, smap)
         for field, value in matched_conditions:
             instruction_part += f" ({field} = '{value}')"
+        if matched_conditions:
+            logger.debug("[execute_single_query] matched_conditions=%s", matched_conditions)
 
-        # Оновлюємо схеми перед генерацією (раптом оновились)
         rev_schema, cost_schema = get_all_schemas()
 
-        # ───── ПРОМПТ: тепер із двома таблицями ─────
         sql_prompt = f"""
 В нас є ДВІ таблиці в BigQuery:
 
@@ -231,18 +265,12 @@ def execute_single_query(instruction: str, smap: dict, user_id: Optional[str] = 
 - Використовуй ТІЛЬКИ BigQuery SQL.
 - Не використовуй STRFTIME; для форматів дат: FORMAT_DATE('%Y-%m', DATE(...)).
 - Не використовуй корельовані підзапити.
-- Якщо потрібні window-функції — використовуй коректно з GROUP BY.
-- Якщо запит тільки про дохід/продажі — бери дані з таблиці REVENUE.
-- Якщо запит тільки про витрати/спенд/кост — бери з таблиці COST.
-- Якщо потрібні **ROAS** або **прибуток**, агрегуй REVENUE і COST ОКРЕМО,
-  потім **JOIN** за спільними полями (спочатку пробуй date/дата;
-  якщо є спільні поля `sourceMedium/source`, `campaign`, `app_name` — додай їх у ключі джойну).
-- **ROAS = revenue_value / cost_value**.
-- **Профіт/прибуток = revenue_value - cost_value**.
-- У таблиці COST вибирай числове поле витрат (перевага назвам: cost, spend, ad_cost, amount, value, usd).
-- У таблиці REVENUE для "net revenue"/"нет ревенью" — сумуй **gross_usd** (НЕ фільтруй event_type='sale'; використовуй усі event_type).
-- Поле **period** (12M/1M/6M) — це **тип підписки**, не часовий період. Його можна використовувати тільки в GROUP BY для розрізів типів підписки. Не використовуй period у LAG/LEAD/ORDER BY як час.
-- Повертай тільки фінальний SQL-запит без пояснень.
+- Якщо запит тільки про дохід/продажі — REVENUE.
+- Якщо тільки про витрати — COST.
+- Для ROAS/прибутку — агрегуй окремо та JOIN.
+- У REVENUE для «net revenue» — сумуй gross_usd (усі event_type).
+- period (12M/1M/6M) — це тип підписки, не час.
+- Поверни лише фінальний SQL без пояснень.
 """
         response = model.generate_content(sql_prompt, generation_config={"temperature": 0})
         sql_query = response.text.strip().replace("```sql", "").replace("```", "").strip()
@@ -250,22 +278,31 @@ def execute_single_query(instruction: str, smap: dict, user_id: Optional[str] = 
             sql_query = sql_query[3:].strip()
 
         errs = validate_sql_syntax(sql_query)
+        logger.debug("[execute_single_query] generated SQL:\n%s", sql_query)
         if errs:
+            logger.warning("[execute_single_query] validation errors: %s", errs)
             return "❌ **Помилка в запиті:**\n" + "\n".join(f"• {e}" for e in errs)
 
         try:
             df = execute_cached_query(sql_query)
-        except Exception as bq_error:
-            msg = "❌ **Помилка при виконанні запиту до бази даних.**\n"
-            if "Window ORDER BY" in str(bq_error):
-                msg += "💡 Порада: проблема з window-функцією. Спробуй простіше згортання."
-            elif "Correlated subqueries" in str(bq_error):
-                msg += "💡 Порада: приберіть корельовані підзапити."
-            elif "invalidQuery" in str(bq_error):
-                msg += "💡 Порада: синтаксична помилка в SQL."
-            return msg
+        except BadRequest as e:
+            msg = getattr(e, "message", str(e))[:600]
+            out = "❌ **Помилка при виконанні запиту до бази даних.**\n"
+            if RETURN_SQL_ON_ERROR:
+                out += f"SQL:\n```sql\n{sql_query[:1500]}\n```\n"
+            out += f"Помилка BigQuery:\n```\n{msg}\n```"
+            return out
+        except Exception as e:
+            msg = (getattr(e, "message", None) or str(e))[:600]
+            logger.exception("[execute_single_query] unexpected error")
+            out = "❌ **Помилка при виконанні запиту до бази даних.**\n"
+            if RETURN_SQL_ON_ERROR:
+                out += f"SQL:\n```sql\n{sql_query[:1500]}\n```\n"
+            out += f"Деталі:\n```\n{msg}\n```"
+            return out
 
         if df.empty:
+            logger.info("[execute_single_query] empty result")
             return "Результат таблиці порожній."
 
         analysis_prompt = f"""
@@ -278,43 +315,37 @@ CSV результат SQL:
 Вимоги:
 - Не повертай SQL у відповіді.
 - Не вигадуй даних або дат — тільки те, що в таблиці.
-- Якщо я просив аналітику/пояснення причин — не більше 3–4 речень.
+- Якщо просили аналіз — до 3–4 речень.
 - period (12M/1M/6M) — це типи підписок, не час.
-- Якщо є розрізи, можна зазначити: "підписка 12M працює краще ніж 1M".
 """
         analysis_response = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
         return analysis_response.text.strip()
 
     except Exception as e:
-        return f"Помилка під час обробки:\n{str(e)}"
+        logger.exception("[execute_single_query] fatal")
+        return "Помилка під час обробки:\n" + (getattr(e, "message", None) or str(e))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 8) Обробка складних повідомлень і фінальний висновок
-# ──────────────────────────────────────────────────────────────────────────────
-def process_slack_message(message: str, smap: dict, user_id: Optional[str] = None) -> str:
+
+def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     try:
         if not message.strip():
             return "Повідомлення порожнє. Напиши інструкцію."
-
-        if user_id:
-            logging.info(f"[process_slack_message] user_id={user_id}, message={message}")
-
         queries = split_into_separate_queries(message)
-
         if len(queries) == 1:
-            return execute_single_query(queries[0], smap, user_id)
+            return execute_single_query(queries[0], smap, user_id=user_id)
 
         results = []
         for i, q in enumerate(queries, 1):
-            logging.info(f"Виконання запиту {i}/{len(queries)}: {q} (user_id={user_id})")
-            results.append((i, q, execute_single_query(q, smap, user_id)))
+            logger.info("[process_slack_message] user_id=%s part=%d/%d: %s", user_id, i, len(queries), q)
+            results.append((i, q, execute_single_query(q, smap, user_id=user_id)))
 
         final = f"📝 **Знайдено {len(queries)} запитів. Відповідаю на кожен:**\n\n"
         for i, q, r in results:
             final += f"**🔍 Запит {i}:** *{q}*\n\n{r}\n\n" + "="*60 + "\n\n"
         return final.rstrip("\n=").rstrip()
-    except Exception as e:
-        return f"Помилка під час обробки повідомлення:\n{str(e)}"
+    except Exception:
+        logger.exception("[process_slack_message] fatal")
+        return "Помилка під час обробки повідомлення."
 
 
 def generate_final_conclusion(results: list, original_message: str) -> str:
@@ -339,7 +370,7 @@ def generate_final_conclusion(results: list, original_message: str) -> str:
     except Exception:
         return f"📋 **ЗАГАЛЬНИЙ ВИСНОВОК:**\nВсі запити оброблено успішно."
 
-# Утиліти кешу
+# Utils
 def clear_cache():
     global query_cache, _schema_cache
     query_cache.clear()
