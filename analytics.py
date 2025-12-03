@@ -27,7 +27,7 @@ BQ_DATASET       = os.getenv("BQ_DATASET", "uploads")
 BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
 VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
-LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")     # >>> додаємо TZ для дат
+LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")     # TZ для дат
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -92,7 +92,9 @@ def get_all_schemas():
 # попередньо ініціалізуй (корисно для першого промпта)
 _ = get_all_schemas()
 
-# >>> утиліти для дат
+# ──────────────────────────────────────────────────────────────────────────────
+# УТИЛІТИ ДАТ / SQL / CSV
+# ──────────────────────────────────────────────────────────────────────────────
 def _collect_date_columns(schema_list):
     """Повертає множину полів, які мають DATE/DATETIME/TIMESTAMP (щоб їх не парсили як STRING)."""
     return {
@@ -101,15 +103,20 @@ def _collect_date_columns(schema_list):
         if f.get("type") in ("DATE", "DATETIME", "TIMESTAMP")
     }
 
+
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     """
     Пост-обробка SQL: прибирає PARSE_DATE(..., <date_col>) та SAFE.PARSE_DATE для відомих DATE-полів,
     підставляє CURRENT_DATE('<tz>') якщо без TZ.
     """
     original = sql_query
+    upper = sql_query.upper()
+
+    # Якщо немає ні CURRENT_DATE, ні PARSE_DATE — нічого не робимо
+    if "CURRENT_DATE" not in upper and "PARSE_DATE" not in upper and "SAFE.PARSE_DATE" not in upper:
+        return sql_query
 
     # 1) CURRENT_DATE() / CURRENT_DATE  → CURRENT_DATE('Europe/Kyiv')
-    #    (не чіпає, якщо TZ уже заданий)
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -127,43 +134,154 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     for col in sorted(date_columns, key=len, reverse=True):
         # з іменами-аліасами типу t.posting_date або `posting_date`
         pattern_plain = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+
         def _repl_plain(m):
             inner = m.group(1)
-            # повністю збігається з колоною (або з суфіксом .col)
             inner_clean = inner.strip("`")
             if inner_clean.endswith(f".{col}") or inner_clean == col:
                 return inner
             return m.group(0)
+
         sql_query = re.sub(pattern_plain, _repl_plain, sql_query, flags=re.IGNORECASE)
 
         # SAFE.PARSE_DATE(...) -> CAST(col AS DATE)
         pattern_safe = rf"SAFE\.PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+
         def _repl_safe(m):
             inner = m.group(1)
             inner_clean = inner.strip("`")
             if inner_clean.endswith(f".{col}") or inner_clean == col:
                 return f"CAST({inner} AS DATE)"
             return m.group(0)
+
         sql_query = re.sub(pattern_safe, _repl_safe, sql_query, flags=re.IGNORECASE)
 
     if sql_query != original:
         logger.info("[sanitize] SQL was sanitized for date handling")
 
     return sql_query
-# <<< кінець утиліт
+
+
+def normalize_sql(sql: str) -> str:
+    """Нормалізація SQL для кешу (щоб дрібні відмінності не ламали cache)."""
+    sql = sql.strip()
+    sql = re.sub(r"\s+", " ", sql)
+    sql = sql.lower()
+    return sql
+
+
+def limited_csv(df: pd.DataFrame, max_rows: int = 7) -> str:
+    """
+    Даємо Vertex тільки невеликий фрагмент результату, щоб не годувати його тисячами рядків.
+    Це сильно пришвидшує аналіз.
+    """
+    if df.empty:
+        return "EMPTY_RESULT"
+
+    if len(df) <= max_rows:
+        return df.to_csv(index=False)
+
+    # head + tail
+    half = max_rows // 2
+    head = df.head(half)
+    tail = df.tail(max_rows - half)
+
+    txt = "HEAD:\n" + head.to_csv(index=False)
+    txt += "\nTAIL:\n" + tail.to_csv(index=False)
+    txt += f"\n[TRUNCATED] total_rows={len(df)}"
+    return txt
+
+
+def auto_fix_group_by(sql: str) -> str:
+    """
+    Автоматичний фікс Vertex-помилки:
+    'column X which is neither grouped nor aggregated'.
+    Додає пропущені поля в GROUP BY.
+    """
+    try:
+        # SELECT ... FROM
+        m = re.search(r"select(.*?)from", sql, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return sql
+        select_block = m.group(1)
+
+        # Поля з SELECT без агрегатів
+        fields = []
+        for part in select_block.split(","):
+            clean = part.strip()
+            if not clean:
+                continue
+
+            # ігноруємо агрегати
+            if re.search(r"(sum|count|min|max|avg)\s*\(", clean, re.IGNORECASE):
+                continue
+
+            # видаляємо alias
+            clean_no_alias = re.sub(r"\s+as\s+.*", "", clean, flags=re.IGNORECASE).strip()
+
+            # ігноруємо літерали
+            if clean_no_alias.startswith("'") or clean_no_alias.startswith('"'):
+                continue
+
+            fields.append(clean_no_alias)
+
+        # GROUP BY
+        gb = re.search(
+            r"group\s+by(.*?)(order\s+by|limit|$)",
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not gb:
+            return sql
+
+        group_by_raw = gb.group(1)
+        group_cols = [x.strip() for x in group_by_raw.split(",") if x.strip()]
+
+        # Визначаємо, яких полів не вистачає
+        missing = []
+        for f in fields:
+            base_f = f.split(".")[-1].lower()
+            found = any(base_f == g.split(".")[-1].lower() for g in group_cols)
+            if not found:
+                missing.append(f)
+
+        if not missing:
+            return sql
+
+        new_group_by = "GROUP BY " + ", ".join(group_cols + missing)
+
+        fixed_sql = re.sub(
+            r"group\s+by(.*?)(order\s+by|limit|$)",
+            new_group_by + r" \2",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        logger.info("[auto_fix_group_by] added to GROUP BY: %s", missing)
+        return fixed_sql
+    except Exception:
+        # у випадку фейлу не ламаємо запит
+        logger.exception("[auto_fix_group_by] failed")
+        return sql
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BQ EXECUTOR (with logging)
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_cached_query(sql_query: str):
-    cache_key = get_cache_key(sql_query)
+    # нормалізований SQL як ключ кешу
+    cache_key = get_cache_key(normalize_sql(sql_query))
     now = time.time()
 
     # cache HIT
     if cache_key in query_cache:
         df, ts = query_cache[cache_key]
         if now - ts < cache_ttl:
-            logger.info("[bq] cache HIT key=%s age=%.1fs rows=%d", cache_key[:8], now - ts, len(df))
+            logger.info(
+                "[bq] cache HIT key=%s age=%.1fs rows=%d",
+                cache_key[:8],
+                now - ts,
+                len(df),
+            )
             return df
 
     # cache MISS
@@ -191,6 +309,7 @@ def execute_cached_query(sql_query: str):
         logger.exception("[bq] FAILED job_id=%s", getattr(job, "job_id", "?"))
         raise
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # SQL SYNTAX VALIDATION (light checks)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,14 +324,18 @@ def validate_sql_syntax(sql_query: str):
         ):
             errors.append(f"Window ORDER BY містить поле '{order_expr.strip()}', яке не згруповане")
 
-    if re.search(r'WHERE\s+\w+\s+IN\s*\(\s*SELECT.*WHERE.*\w+\.\w+\s*=\s*\w+\.\w+', sql_query,
-                 re.IGNORECASE | re.DOTALL):
+    if re.search(
+        r'WHERE\s+\w+\s+IN\s*\(\s*SELECT.*WHERE.*\w+\.\w+\s*=\s*\w+\.\w+',
+        sql_query,
+        re.IGNORECASE | re.DOTALL,
+    ):
         errors.append("Використані корельовані підзапити, які не підтримуються BigQuery")
 
     if 'STRFTIME' in sql_query.upper():
         errors.append("STRFTIME не підтримується в BigQuery. Використовуйте FORMAT_DATE")
 
     return errors
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AI matching
@@ -262,6 +385,7 @@ def find_matches_with_ai_cached(instruction: str, semantic_map_str: str):
 def find_matches_with_ai(instruction, smap):
     return find_matches_with_ai_cached(instruction, json.dumps(smap, sort_keys=True))
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Split complex message
 # ──────────────────────────────────────────────────────────────────────────────
@@ -289,6 +413,7 @@ def split_into_separate_queries(message: str) -> list:
         return queries if queries else [message]
     except Exception:
         return [message]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main executors
@@ -347,8 +472,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         if sql_query.lower().startswith("sql"):
             sql_query = sql_query[3:].strip()
 
-        # >>> пост-обробка SQL (прибрати PARSE_DATE на DATE-полях, додати TZ)
+        # >>> пост-обробка SQL (дати + авто-ремонт GROUP BY)
         sql_query = _sanitize_sql_dates(sql_query, date_cols)
+        sql_query = auto_fix_group_by(sql_query)
         # <<<
 
         errs = validate_sql_syntax(sql_query)
@@ -383,8 +509,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 Зроби те, що просить користувач в інструкції.
 Інструкція: "{instruction_part}"
 
-CSV результат SQL:
-{df.to_csv(index=False)}
+CSV результат SQL (урізаний до важливого):
+{limited_csv(df)}
 
 Вимоги:
 - Не повертай SQL у відповіді.
@@ -444,6 +570,7 @@ def generate_final_conclusion(results: list, original_message: str) -> str:
     except Exception:
         return f"📋 **ЗАГАЛЬНИЙ ВИСНОВОК:**\nВсі запити оброблено успішно."
 
+
 # Utils
 def clear_cache():
     global query_cache, _schema_cache
@@ -452,8 +579,9 @@ def clear_cache():
     _schema_time.clear()
     find_matches_with_ai_cached.cache_clear()
 
+
 def get_cache_stats():
     return {
         "query_cache_size": len(query_cache),
-        "ai_cache_info": find_matches_with_ai_cached.cache_info()
+        "ai_cache_info": find_matches_with_ai_cached.cache_info(),
     }
