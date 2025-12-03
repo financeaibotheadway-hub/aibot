@@ -9,6 +9,8 @@ import hashlib
 import logging
 import traceback
 from functools import lru_cache
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 from google.cloud import bigquery
@@ -35,6 +37,19 @@ logger = logging.getLogger("ai-bot")
 
 # якщо TRUE — у відповідь у Slack додамо обрізаний SQL і текст помилки
 RETURN_SQL_ON_ERROR = os.getenv("RETURN_SQL_ON_ERROR", "false").lower() == "true"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# THREADPOOL (гібридний async + threads)
+# ──────────────────────────────────────────────────────────────────────────────
+MAX_WORKERS = int(os.getenv("AI_BOT_WORKERS", "4"))
+_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+
+async def _run_in_executor(func, *args, **kwargs):
+    """Універсальна обгортка: запуск будь-якої sync-функції в threadpool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, lambda: func(*args, **kwargs))
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INIT CLIENTS
@@ -174,6 +189,7 @@ def limited_csv(df: pd.DataFrame, max_rows: int = 7) -> str:
     """
     Даємо Vertex тільки невеликий фрагмент результату, щоб не годувати його тисячами рядків.
     Це сильно пришвидшує аналіз.
+    (BQ завжди працює з повною таблицею, це лише для prompt'а аналізу)
     """
     if df.empty:
         return "EMPTY_RESULT"
@@ -416,7 +432,7 @@ def split_into_separate_queries(message: str) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main executors
+# Main executors (sync)
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown") -> str:
     try:
@@ -528,20 +544,31 @@ CSV результат SQL (урізаний до важливого):
 
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     try:
-        if not message.strip():
+        msg = message or ""
+        if not msg.strip():
             return "Повідомлення порожнє. Напиши інструкцію."
-        queries = split_into_separate_queries(message)
+
+        queries = split_into_separate_queries(msg)
         if len(queries) == 1:
+            # один запит — просто виконуємо
             return execute_single_query(queries[0], smap, user_id=user_id)
 
         results = []
         for i, q in enumerate(queries, 1):
-            logger.info("[process_slack_message] user_id=%s part=%d/%d: %s", user_id, i, len(queries), q)
-            results.append((i, q, execute_single_query(q, smap, user_id=user_id)))
+            try:
+                logger.info(
+                    "[process_slack_message] user_id=%s part=%d/%d: %s",
+                    user_id, i, len(queries), q
+                )
+                ans = execute_single_query(q, smap, user_id=user_id)
+            except Exception:
+                logger.exception("[process_slack_message] failed on part %d", i)
+                ans = "❌ Помилка під час обробки цього окремого запиту."
+            results.append((i, q, ans))
 
         final = f"📝 **Знайдено {len(queries)} запитів. Відповідаю на кожен:**\n\n"
         for i, q, r in results:
-            final += f"**🔍 Запит {i}:** *{q}*\n\n{r}\n\n" + "="*60 + "\n\n"
+            final += f"**🔍 Запит {i}:** *{q}*\n\n{r}\n\n" + "=" * 60 + "\n\n"
         return final.rstrip("\n=").rstrip()
     except Exception:
         logger.exception("[process_slack_message] fatal")
@@ -569,6 +596,25 @@ def generate_final_conclusion(results: list, original_message: str) -> str:
         return f"📋 **ЗАГАЛЬНИЙ ВИСНОВОК:**\n{response.text.strip()}"
     except Exception:
         return f"📋 **ЗАГАЛЬНИЙ ВИСНОВОК:**\nВсі запити оброблено успішно."
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ASYNC-версії API (для FastAPI / Slack handler)
+# ──────────────────────────────────────────────────────────────────────────────
+async def execute_single_query_async(instruction: str, smap: dict, user_id: str = "unknown") -> str:
+    """
+    Async-обгортка для execute_single_query.
+    Логіка та інструкції для AI залишаються тими самими.
+    """
+    return await _run_in_executor(execute_single_query, instruction, smap, user_id)
+
+
+async def process_slack_message_async(message: str, smap: dict, user_id: str = "unknown") -> str:
+    """
+    Async-обгортка для process_slack_message.
+    Можна викликати з async FastAPI-ендпоінта, не блокуючи event loop.
+    """
+    return await _run_in_executor(process_slack_message, message, smap, user_id)
 
 
 # Utils
