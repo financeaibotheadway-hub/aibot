@@ -281,6 +281,85 @@ def auto_fix_group_by(sql: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# EXTRA SQL FIXES (FORMAT_DATE + зайві коми)
+# ──────────────────────────────────────────────────────────────────────────────
+def fix_format_date(sql: str) -> str:
+    """
+    Лікує FORMAT_DATE помилки:
+    - неправильна кількість аргументів
+    - зайві/відсутні коми
+    - відсутній alias
+    """
+    # FORMAT_DATE('%Y-%m')  → вважаємо, що потрібно за posting_date
+    sql = re.sub(
+        r"FORMAT_DATE\s*\(\s*'([^']+)'\s*\)",
+        r"FORMAT_DATE('\1', posting_date)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # FORMAT_DATE('%Y-%m', posting_date,) → прибрати зайву кому
+    sql = re.sub(
+        r"FORMAT_DATE\s*\(([^,]+),\s*([^)]+),\s*\)",
+        r"FORMAT_DATE(\1, \2)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # FORMAT_DATE('%Y-%m' posting_date) → вставити кому
+    sql = re.sub(
+        r"FORMAT_DATE\s*\(\s*'([^']+)'\s+(\w+)\s*\)",
+        r"FORMAT_DATE('\1', \2)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # FORMAT_DATE(...) без alias'а → додаємо AS month
+    sql = re.sub(
+        r"(FORMAT_DATE\s*\([^)]+\))(?!\s+as|\s*,)",
+        r"\1 AS month",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    return sql
+
+
+def fix_trailing_commas(sql: str) -> str:
+    """
+    Прибирає зайві коми:
+    - перед FROM/WHERE/GROUP BY/ORDER BY
+    - подвійні коми
+    - коми перед закриваючою дужкою
+    """
+    sql = re.sub(r",\s*(FROM|WHERE|GROUP BY|ORDER BY)", r" \1", sql, flags=re.IGNORECASE)
+    sql = re.sub(r",\s*\n\s*(FROM|WHERE|GROUP BY|ORDER BY)", r"\n\1", sql, flags=re.IGNORECASE)
+    sql = re.sub(r",\s*,", ", ", sql)
+    sql = re.sub(r",\s*\)", ")", sql)
+    return sql
+
+
+def full_sql_fix(sql: str, date_cols: set) -> str:
+    """
+    Єдиний pipeline для ремонту SQL:
+    - timezone + DATE-поля
+    - FORMAT_DATE
+    - зайві коми
+    - GROUP BY
+    """
+    sql_before = sql
+    sql = _sanitize_sql_dates(sql, date_cols)
+    sql = fix_format_date(sql)
+    sql = fix_trailing_commas(sql)
+    sql = auto_fix_group_by(sql)
+
+    if sql != sql_before:
+        logger.info("[sql fix] SQL was post-processed by full_sql_fix")
+
+    return sql
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # BQ EXECUTOR (with logging)
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_cached_query(sql_query: str):
@@ -488,9 +567,11 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         if sql_query.lower().startswith("sql"):
             sql_query = sql_query[3:].strip()
 
-        # >>> пост-обробка SQL (дати + авто-ремонт GROUP BY)
-        sql_query = _sanitize_sql_dates(sql_query, date_cols)
-        sql_query = auto_fix_group_by(sql_query)
+        logger.info("[sql raw] %s", sql_query)
+
+        # >>> пост-обробка SQL (дати + FORMAT_DATE + коми + GROUP BY)
+        sql_query = full_sql_fix(sql_query, date_cols)
+        logger.info("[sql fixed] %s", sql_query)
         # <<<
 
         errs = validate_sql_syntax(sql_query)
@@ -604,7 +685,7 @@ def generate_final_conclusion(results: list, original_message: str) -> str:
 async def execute_single_query_async(instruction: str, smap: dict, user_id: str = "unknown") -> str:
     """
     Async-обгортка для execute_single_query.
-    Логіка та інструкції для AI залишаються тими самими.
+    Логіка та інструкції для AI залишаються тими ж.
     """
     return await _run_in_executor(execute_single_query, instruction, smap, user_id)
 
