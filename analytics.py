@@ -7,14 +7,13 @@ import json
 import time
 import hashlib
 import logging
-import traceback
 from functools import lru_cache
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 from google.cloud import bigquery
-from google.api_core.exceptions import BadRequest, GoogleAPIError
+from google.api_core.exceptions import BadRequest
 
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
@@ -186,11 +185,7 @@ def normalize_sql(sql: str) -> str:
 
 
 def limited_csv(df: pd.DataFrame, max_rows: int = 7) -> str:
-    """
-    Даємо Vertex тільки невеликий фрагмент результату, щоб не годувати його тисячами рядків.
-    Це сильно пришвидшує аналіз.
-    (BQ завжди працює з повною таблицею, це лише для prompt'а аналізу)
-    """
+    """Даємо Vertex тільки невеликий фрагмент результату для аналізу."""
     if df.empty:
         return "EMPTY_RESULT"
 
@@ -209,19 +204,13 @@ def limited_csv(df: pd.DataFrame, max_rows: int = 7) -> str:
 
 
 def auto_fix_group_by(sql: str) -> str:
-    """
-    Автоматичний фікс Vertex-помилки:
-    'column X which is neither grouped nor aggregated'.
-    Додає пропущені поля в GROUP BY.
-    """
+    """Автоматичний фікс помилки 'column X which is neither grouped nor aggregated'."""
     try:
-        # SELECT ... FROM
         m = re.search(r"select(.*?)from", sql, re.IGNORECASE | re.DOTALL)
         if not m:
             return sql
         select_block = m.group(1)
 
-        # Поля з SELECT без агрегатів
         fields = []
         for part in select_block.split(","):
             clean = part.strip()
@@ -241,7 +230,6 @@ def auto_fix_group_by(sql: str) -> str:
 
             fields.append(clean_no_alias)
 
-        # GROUP BY
         gb = re.search(
             r"group\s+by(.*?)(order\s+by|limit|$)",
             sql,
@@ -253,7 +241,6 @@ def auto_fix_group_by(sql: str) -> str:
         group_by_raw = gb.group(1)
         group_cols = [x.strip() for x in group_by_raw.split(",") if x.strip()]
 
-        # Визначаємо, яких полів не вистачає
         missing = []
         for f in fields:
             base_f = f.split(".")[-1].lower()
@@ -275,7 +262,6 @@ def auto_fix_group_by(sql: str) -> str:
         logger.info("[auto_fix_group_by] added to GROUP BY: %s", missing)
         return fixed_sql
     except Exception:
-        # у випадку фейлу не ламаємо запит
         logger.exception("[auto_fix_group_by] failed")
         return sql
 
@@ -284,12 +270,8 @@ def auto_fix_group_by(sql: str) -> str:
 # EXTRA SQL FIXES (FORMAT_DATE + зайві коми)
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_format_date(sql: str) -> str:
-    """
-    Лікує FORMAT_DATE помилки:
-    - неправильна кількість аргументів
-    - зайві/відсутні коми
-    - відсутній alias
-    """
+    """Лікує типові помилки з FORMAT_DATE."""
+
     # FORMAT_DATE('%Y-%m')  → вважаємо, що потрібно за posting_date
     sql = re.sub(
         r"FORMAT_DATE\s*\(\s*'([^']+)'\s*\)",
@@ -300,7 +282,7 @@ def fix_format_date(sql: str) -> str:
 
     # FORMAT_DATE('%Y-%m', posting_date,) → прибрати зайву кому
     sql = re.sub(
-        r"FORMAT_DATE\s*\(([^,]+),\s*([^)]+),\s*\)",
+        r"FORMAT_DATE\s*\(([^,]+),\s*([^\)]+),\s*\)",
         r"FORMAT_DATE(\1, \2)",
         sql,
         flags=re.IGNORECASE,
@@ -316,7 +298,7 @@ def fix_format_date(sql: str) -> str:
 
     # FORMAT_DATE(...) без alias'а → додаємо AS month
     sql = re.sub(
-        r"(FORMAT_DATE\s*\([^)]+\))(?!\s+as|\s*,)",
+        r"(FORMAT_DATE\s*\([^\)]+\))(?!\s+as|\s*,)",
         r"\1 AS month",
         sql,
         flags=re.IGNORECASE,
@@ -326,27 +308,20 @@ def fix_format_date(sql: str) -> str:
 
 
 def fix_trailing_commas(sql: str) -> str:
-    """
-    Прибирає зайві коми:
-    - перед FROM/WHERE/GROUP BY/ORDER BY
-    - подвійні коми
-    - коми перед закриваючою дужкою
-    """
+    """Прибирає зайві коми перед FROM/WHERE/GROUP BY/ORDER BY і перед закриваючою дужкою."""
+    # кома перед ключовими словами
     sql = re.sub(r",\s*(FROM|WHERE|GROUP BY|ORDER BY)", r" \1", sql, flags=re.IGNORECASE)
+    # кома перед переведенням рядка + ключовим словом
     sql = re.sub(r",\s*\n\s*(FROM|WHERE|GROUP BY|ORDER BY)", r"\n\1", sql, flags=re.IGNORECASE)
+    # подвійні коми
     sql = re.sub(r",\s*,", ", ", sql)
+    # кома перед закриваючою дужкою
     sql = re.sub(r",\s*\)", ")", sql)
     return sql
 
 
 def full_sql_fix(sql: str, date_cols: set) -> str:
-    """
-    Єдиний pipeline для ремонту SQL:
-    - timezone + DATE-поля
-    - FORMAT_DATE
-    - зайві коми
-    - GROUP BY
-    """
+    """Єдиний pipeline для ремонту SQL."""
     sql_before = sql
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = fix_format_date(sql)
@@ -411,22 +386,22 @@ def execute_cached_query(sql_query: str):
 def validate_sql_syntax(sql_query: str):
     errors = []
 
-    window_pattern = r'(?:ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD)\s*\(\s*\)\s+OVER\s*\([^)]*ORDER\s+BY\s+([^)]+)\)'
+    window_pattern = r"(?:ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD)\s*\(\s*\)\s+OVER\s*\([^)]*ORDER\s+BY\s+([^)]+)\)"
     window_matches = re.findall(window_pattern, sql_query, re.IGNORECASE)
     for order_expr in window_matches:
-        if 'GROUP BY' in sql_query.upper() and not any(
-            field in sql_query.split('GROUP BY')[1] for field in order_expr.split(',')
+        if "GROUP BY" in sql_query.upper() and not any(
+            field in sql_query.split("GROUP BY")[1] for field in order_expr.split(",")
         ):
             errors.append(f"Window ORDER BY містить поле '{order_expr.strip()}', яке не згруповане")
 
     if re.search(
-        r'WHERE\s+\w+\s+IN\s*\(\s*SELECT.*WHERE.*\w+\.\w+\s*=\s*\w+\.\w+',
+        r"WHERE\s+\w+\s+IN\s*\(\s*SELECT.*WHERE.*\w+\.\w+\s*=\s*\w+\.\w+",
         sql_query,
         re.IGNORECASE | re.DOTALL,
     ):
         errors.append("Використані корельовані підзапити, які не підтримуються BigQuery")
 
-    if 'STRFTIME' in sql_query.upper():
+    if "STRFTIME" in sql_query.upper():
         errors.append("STRFTIME не підтримується в BigQuery. Використовуйте FORMAT_DATE")
 
     return errors
@@ -468,9 +443,9 @@ def find_matches_with_ai_cached(instruction: str, semantic_map_str: str):
         if result == "NONE":
             return []
         matches = []
-        for pair in result.split(','):
-            if ':' in pair:
-                field, value = pair.strip().split(':', 1)
+        for pair in result.split(","):
+            if ":" in pair:
+                field, value = pair.strip().split(":", 1)
                 matches.append((field, value))
         return matches
     except Exception:
@@ -499,10 +474,10 @@ def split_into_separate_queries(message: str) -> list:
         response = model.generate_content(split_prompt, generation_config={"temperature": 0})
         result = response.text.strip()
         queries = []
-        for line in result.split('\n'):
+        for line in result.split("\n"):
             line = line.strip()
-            if line.startswith('ЗАПИТ_'):
-                parts = line.split(':', 1)
+            if line.startswith("ЗАПИТ_"):
+                parts = line.split(":", 1)
                 if len(parts) == 2 and parts[1].strip():
                     queries.append(parts[1].strip())
         return queries if queries else [message]
@@ -529,10 +504,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         rev_schema, cost_schema = get_all_schemas()
 
-        # >>> зберемо відомі DATE-поля (щоб не парсити їх як STRING)
+        # зберемо відомі DATE-поля (щоб не парсити їх як STRING)
         date_cols = _collect_date_columns(rev_schema) | _collect_date_columns(cost_schema)
         date_cols_list = sorted(list(date_cols))
-        # <<<
 
         sql_prompt = f"""
 В нас є ДВІ таблиці в BigQuery:
@@ -569,10 +543,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         logger.info("[sql raw] %s", sql_query)
 
-        # >>> пост-обробка SQL (дати + FORMAT_DATE + коми + GROUP BY)
+        # пост-обробка SQL (дати + FORMAT_DATE + коми + GROUP BY)
         sql_query = full_sql_fix(sql_query, date_cols)
         logger.info("[sql fixed] %s", sql_query)
-        # <<<
 
         errs = validate_sql_syntax(sql_query)
         logger.debug("[execute_single_query] generated SQL:\n%s", sql_query)
@@ -631,7 +604,6 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 
         queries = split_into_separate_queries(msg)
         if len(queries) == 1:
-            # один запит — просто виконуємо
             return execute_single_query(queries[0], smap, user_id=user_id)
 
         results = []
@@ -683,18 +655,12 @@ def generate_final_conclusion(results: list, original_message: str) -> str:
 # ASYNC-версії API (для FastAPI / Slack handler)
 # ──────────────────────────────────────────────────────────────────────────────
 async def execute_single_query_async(instruction: str, smap: dict, user_id: str = "unknown") -> str:
-    """
-    Async-обгортка для execute_single_query.
-    Логіка та інструкції для AI залишаються тими ж.
-    """
+    """Async-обгортка для execute_single_query."""
     return await _run_in_executor(execute_single_query, instruction, smap, user_id)
 
 
 async def process_slack_message_async(message: str, smap: dict, user_id: str = "unknown") -> str:
-    """
-    Async-обгортка для process_slack_message.
-    Можна викликати з async FastAPI-ендпоінта, не блокуючи event loop.
-    """
+    """Async-обгортка для process_slack_message."""
     return await _run_in_executor(process_slack_message, message, smap, user_id)
 
 
