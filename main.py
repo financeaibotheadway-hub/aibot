@@ -1,6 +1,11 @@
-from fastapi import FastAPI, Request
-from slack_handler import handle_event
-app=FastAPI()
-@app.post('/slack/events')
-async def slack_events(req:Request):
-    return await handle_event(req)
+from fastapi import FastAPI
+from routers.slack_handler import router as slack_router
+
+app = FastAPI()
+
+# підключаємо роут Slack
+app.include_router(slack_router)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "aibot"}
