@@ -1,1 +1,1 @@
-from .analyze import run_analysis
+from .analytics import process_slack_message
