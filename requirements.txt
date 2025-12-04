@@ -4,14 +4,11 @@ python-dotenv
 pandas
 sentence-transformers
 fastapi
-uvicorn
+uvicorn[standard]
 rapidfuzz
 slack-sdk
 aiohttp
 db-dtypes
 cachetools
-google-cloud-aiplatform
-cachetools
-python-dotenv
 sqlparse
 python-dateutil
