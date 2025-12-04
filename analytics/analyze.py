@@ -13,7 +13,7 @@ Slack handler викликає:
 
 from typing import Dict, Any
 
-from analytics_core import process_slack_message
+from .analytics_core import process_slack_message
 
 
 def run_analysis(user_text: str, smap: Dict[str, Any], user_id: str = "unknown") -> str:
