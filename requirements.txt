@@ -13,3 +13,5 @@ cachetools
 google-cloud-aiplatform
 cachetools
 python-dotenv
+sqlparse
+python-dateutil
