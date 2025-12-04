@@ -1,53 +1,52 @@
 # -*- coding: utf-8 -*-
-"""Top‑level API used by Slack handler.
-
-Exports:
-- process_slack_message(message, semantic_map, user_id)
-- process_slack_message_async(...)
+"""
+Unified entry point for Slack handler.
+Implements 4-model pipeline:
+1. intent detection
+2. period parsing (if needed)
+3. trend analysis (root cause / compare)
+4. generic SQL generation (via AI)
 """
 
-import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
-from .intents import classify_intent
-from .trend_analysis import answer_trend_question
-from .generic_sql import run_generic_sql
+from ai_core.intents import classify_intent
+from ai_core.period_parser import extract_period
+from ai_core.trend_analysis import answer_trend_question
+from ai_core.generic_sql import run_generic_sql
 
 logger = logging.getLogger("ai-bot")
 
-_executor = ThreadPoolExecutor(max_workers=4)
 
+def run_analysis(message: str, semantic_map: dict, user_id: str = "unknown") -> str:
+    """
+    Main orchestrator for analytics logic.
+    Called from slack_handler.py
 
-def _run_in_executor(func, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    return loop.run_in_executor(_executor, lambda: func(*args, **kwargs))
+    message → classify_intent → route to handler
+    """
 
-
-def _handle_single(message: str, semantic_map: dict, user_id: str = "unknown") -> str:
-    intent = classify_intent(message)
-    logger.info("[analytics] user_id=%s intent=%s message=%s", user_id, intent.kind, message)
-
-    if intent.kind in {"trend_root_cause", "trend_compare"}:
-        return answer_trend_question(message, intent.kind)
-
-    # For now, all other queries go via generic SQL path (AI builds SQL)
-    return run_generic_sql(message)
-
-
-def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
-    msg = message or ""
-    if not msg.strip():
+    if not message or not message.strip():
         return "Повідомлення порожнє. Напиши інструкцію."
+
     try:
-        return _handle_single(msg, smap, user_id)
+        # 1) Визначаємо інтенцію
+        intent = classify_intent(message)
+        logger.info(f"[analysis] user={user_id} intent={intent.kind} msg={message}")
+
+        # 2) Якщо питання про тренди (падіння, причини, зростання)
+        if intent.kind in {"trend_root_cause", "trend_compare"}:
+
+            period_info = extract_period(message)     # "травень 2024", "за останні 30 днів" etc.
+            return answer_trend_question(
+                message=message,
+                intent_type=intent.kind,
+                period_info=period_info
+            )
+
+        # 3) Всі інші запити → AI SQL генерація
+        return run_generic_sql(message)
+
     except Exception as e:
-        logger.exception("[process_slack_message] fatal")
-        return "Помилка під час обробки повідомлення: " + (getattr(e, "message", None) or str(e))
-
-
-async def process_slack_message_async(message: str, smap: dict, user_id: str = "unknown") -> str:
-    msg = message or ""
-    if not msg.strip():
-        return "Повідомлення порожнє. Напиши інструкцію."
-    return await _run_in_executor(_handle_single, msg, smap, user_id)
+        logger.exception("run_analysis fatal error")
+        return "❌ Помилка під час обробки: " + str(e)
