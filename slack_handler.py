@@ -13,9 +13,9 @@ from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.signature import SignatureVerifier
 from cachetools import TTLCache
 
-# ==== НОВИЙ ІМПОРТ ====
 from analytics import run_analysis
 from semantic_map import semantic_map
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV / LOG
@@ -26,7 +26,7 @@ logger = logging.getLogger("slack")
 
 SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
-SLACK_BOT_USER_ID    = os.getenv("SLACK_BOT_USER_ID")  # optional for mention cleanup
+SLACK_BOT_USER_ID    = os.getenv("SLACK_BOT_USER_ID")
 
 if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
     logger.error("Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET in env")
@@ -34,11 +34,11 @@ if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
 client   = AsyncWebClient(token=SLACK_BOT_TOKEN)
 verifier = SignatureVerifier(signing_secret=SLACK_SIGNING_SECRET)
 
-# To avoid duplicate processing
 processed_event_ids = TTLCache(maxsize=2000, ttl=120)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# helpers
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _strip_bot_mention(text: str) -> str:
     if not text:
@@ -51,20 +51,19 @@ def _strip_bot_mention(text: str) -> str:
 
     return text.strip()
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP handler for /slack/events
+# Slack Events Handler
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_event(req: Request):
 
-    # Slack retry → immediately return OK
     if req.headers.get("X-Slack-Retry-Num"):
         return JSONResponse(content={"ok": True})
 
-    body_bytes = await req.body()
+    raw_body = await req.body()
 
-    # verify signature
     try:
-        if not verifier.is_valid_request(body_bytes, dict(req.headers)):
+        if not verifier.is_valid_request(raw_body, dict(req.headers)):
             logger.warning("Invalid Slack signature")
             return JSONResponse(status_code=401, content={"error": "invalid signature"})
     except Exception:
@@ -77,30 +76,24 @@ async def handle_event(req: Request):
         logger.exception("Bad JSON from Slack")
         return JSONResponse(status_code=400, content={"error": "bad json"})
 
-    # url_verification challenge
     if payload.get("type") == "url_verification":
         return JSONResponse(content={"challenge": payload.get("challenge")})
 
     event = payload.get("event", {}) or {}
     event_id = payload.get("event_id") or event.get("client_msg_id")
 
-    # dedupe
     if event_id and event_id in processed_event_ids:
-        logger.info("Skip duplicated event_id=%s", event_id)
         return JSONResponse(content={"ok": True})
-
     if event_id:
         processed_event_ids[event_id] = True
 
-    # skip bot/system events
     if event.get("bot_id") is not None:
         return JSONResponse(content={"ok": True})
 
     evt_type = event.get("type")
     channel_type = event.get("channel_type")
 
-    # respond only to app_mention or DM
-    if evt_type in ("app_mention",) or channel_type == "im":
+    if evt_type == "app_mention" or channel_type == "im":
 
         raw_text = event.get("text", "")
         user_text = _strip_bot_mention(raw_text)
@@ -109,9 +102,8 @@ async def handle_event(req: Request):
         user_id   = event.get("user", "default_user")
         thread_ts = event.get("thread_ts") or event.get("ts")
 
-        logger.info("✉️ Slack %s from %s: %s", evt_type, user_id, user_text)
+        logger.info(f"Slack message from {user_id}: {user_text}")
 
-        # process asynchronously
         asyncio.create_task(
             _respond_async(user_text, channel, user_id, thread_ts)
         )
@@ -120,29 +112,24 @@ async def handle_event(req: Request):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Async background processor
+# Background Processor
 # ──────────────────────────────────────────────────────────────────────────────
 async def _respond_async(user_text: str, channel: str, user_id: str, thread_ts: str | None):
 
-    # run heavy work in thread
     try:
         response = await asyncio.to_thread(
-            run_analysis,
-            user_text,
-            semantic_map,
-            user_id
+            run_analysis, user_text, semantic_map, user_id
         )
     except Exception as e:
-        logger.exception("❌ Error while processing Slack message")
+        logger.exception("Error in run_analysis()")
         response = f"❌ Помилка: {str(e)}"
 
-    # post back to Slack
     try:
-        kwargs = {"channel": channel, "text": response}
+        msg = {"channel": channel, "text": response}
         if thread_ts:
-            kwargs["thread_ts"] = thread_ts
+            msg["thread_ts"] = thread_ts
 
-        await client.chat_postMessage(**kwargs)
+        await client.chat_postMessage(**msg)
 
     except Exception:
-        logger.exception("❌ Failed to post message to Slack")
+        logger.exception("Failed to post message to Slack")
