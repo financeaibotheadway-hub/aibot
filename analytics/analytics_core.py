@@ -11,7 +11,7 @@ Implements 4-model pipeline:
 import logging
 
 from ai_core.intents import classify_intent
-from ai_core.period_parser import extract_period
+from .period_parser import extract_period
 from ai_core.trend_analysis import answer_trend_question
 from ai_core.generic_sql import run_generic_sql
 
