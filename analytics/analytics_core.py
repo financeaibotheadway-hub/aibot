@@ -353,8 +353,21 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         # <<<
 
         # >>> FIX dangling UNION / UNION ALL at end of SQL
-        sql_query = re.sub(r'(UNION|UNION ALL)\s*$', '', sql_query, flags=re.IGNORECASE)
+        sql_query = re.sub(
+            r'(UNION|UNION ALL)\s*(--.*)?$',
+            '',
+            sql_query.strip(),
+            flags=re.IGNORECASE | re.MULTILINE
+        )
+
+        # >>> FIX: видалити лінії, де залишився лише UNION / UNION ALL
+        lines = sql_query.splitlines()
+        while lines and re.match(r'\s*(UNION|UNION ALL)\s*$', lines[-1], flags=re.IGNORECASE):
+            lines.pop()
+        sql_query = "\n".join(lines)
         # <<<
+
+        errs = validate_sql_syntax(sql_query)
 
         errs = validate_sql_syntax(sql_query)
         logger.debug("[execute_single_query] generated SQL:\n%s", sql_query)
