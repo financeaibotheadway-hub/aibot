@@ -463,3 +463,14 @@ def get_cache_stats():
         "query_cache_size": len(query_cache),
         "ai_cache_info": find_matches_with_ai_cached.cache_info()
     }
+    
+def run_analysis(message: str,
+                 semantic_map_override: dict | None = None,
+                 user_id: str = "unknown") -> str:
+    """
+    Головний entry point, який викликає process_slack_message.
+    semantic_map_override – можемо передати свій semantic_map, якщо треба,
+    інакше використовується дефолтний semantic_map з цього модуля.
+    """
+    smap = semantic_map_override or semantic_map
+    return process_slack_message(message, smap, user_id=user_id)
