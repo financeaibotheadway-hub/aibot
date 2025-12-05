@@ -333,6 +333,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 - Не використовуй STRFTIME; для форматів дат: FORMAT_DATE('%Y-%m', DATE(...)).
 - Не використовуй корельовані підзапити.
 - Якщо запит тільки про дохід/продажі — REVENUE.
+- Не використовуй аналітичні функції з OVER / PARTITION BY / ROW_NUMBER / RANK – роби тільки агрегати через GROUP BY.
 - Якщо тільки про витрати — COST.
 - Для ROAS/прибутку — агрегуй окремо та JOIN.
 - У REVENUE для «net revenue» — сумуй gross_usd (усі event_type).
