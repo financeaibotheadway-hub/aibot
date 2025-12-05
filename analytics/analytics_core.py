@@ -352,6 +352,10 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         sql_query = _sanitize_sql_dates(sql_query, date_cols)
         # <<<
 
+        # >>> FIX dangling UNION / UNION ALL at end of SQL
+        sql_query = re.sub(r'(UNION|UNION ALL)\s*$', '', sql_query, flags=re.IGNORECASE)
+        # <<<
+
         errs = validate_sql_syntax(sql_query)
         logger.debug("[execute_single_query] generated SQL:\n%s", sql_query)
         if errs:
