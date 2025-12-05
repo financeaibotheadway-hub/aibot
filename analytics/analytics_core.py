@@ -333,7 +333,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 - Не використовуй STRFTIME; для форматів дат: FORMAT_DATE('%Y-%m', DATE(...)).
 - Не використовуй корельовані підзапити.
 - Якщо запит тільки про дохід/продажі — REVENUE.
-- Не використовуй аналітичні функції з OVER / PARTITION BY / ROW_NUMBER / RANK – роби тільки агрегати через GROUP BY.
 - Якщо тільки про витрати — COST.
 - Для ROAS/прибутку — агрегуй окремо та JOIN.
 - У REVENUE для «net revenue» — сумуй gross_usd (усі event_type).
@@ -354,21 +353,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         # <<<
 
         # >>> FIX dangling UNION / UNION ALL at end of SQL
-        sql_query = re.sub(
-            r'(UNION|UNION ALL)\s*(--.*)?$',
-            '',
-            sql_query.strip(),
-            flags=re.IGNORECASE | re.MULTILINE
-        )
-
-        # >>> FIX: видалити лінії, де залишився лише UNION / UNION ALL
-        lines = sql_query.splitlines()
-        while lines and re.match(r'\s*(UNION|UNION ALL)\s*$', lines[-1], flags=re.IGNORECASE):
-            lines.pop()
-        sql_query = "\n".join(lines)
+        sql_query = re.sub(r'(UNION|UNION ALL)\s*$', '', sql_query, flags=re.IGNORECASE)
         # <<<
-
-        errs = validate_sql_syntax(sql_query)
 
         errs = validate_sql_syntax(sql_query)
         logger.debug("[execute_single_query] generated SQL:\n%s", sql_query)
@@ -492,3 +478,4 @@ def run_analysis(message: str,
     """
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id=user_id)
+
