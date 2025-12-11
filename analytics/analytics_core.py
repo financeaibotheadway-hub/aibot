@@ -136,31 +136,6 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FIX WINDOW ORDER BY ERRORS  (CLEAN FIX)
-# ──────────────────────────────────────────────────────────────────────────────
-def fix_window_order_by(sql: str) -> str:
-    """
-    Fix ORDER BY inside window functions.
-    - If OVER(...) contains ORDER BY but NOT LAG/LEAD → remove ORDER BY
-    - If LAG/LEAD present → keep ORDER BY (BigQuery requires it)
-    """
-
-    def _fix(match):
-        over_clause = match.group(0)
-
-        # If contains LAG or LEAD → keep as is
-        if re.search(r"\bLAG\s*$begin:math:text$\|\\bLEAD\\s\*\\\(\"\, over\_clause\, flags\=re\.IGNORECASE\)\:
-            return over\_clause
-
-        \# Remove ORDER BY inside window frame
-        cleaned \= re\.sub\(r\"ORDER\\s\+BY\[\^\)\]\*\"\, \"\"\, over\_clause\, flags\=re\.IGNORECASE\)
-        return cleaned
-
-    \# Apply to all OVER\(\.\.\.\)
-    return re\.sub\(r\"OVER\\s\*\\\(\[\^\)\]\*$end:math:text$", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_cached_query(sql_query: str):
@@ -290,14 +265,16 @@ COST_TABLE    = `{COST_TABLE_REF}`
 {json.dumps(cost_schema, indent=2)}
 
 Правила:
-- Використовуй ТІЛЬКИ ті поля, які є в списках колонок вище. Не вигадуй нових полів.
+- Використовуй ТІЛЬКИ ті поля, які є в списках колонок вище. Не вигадуй нових полів (наприклад, event_type), якщо їх немає в схемі.
 - Якщо запит про "opex", "cost", "витрати", "спенд" — використовуй таблицю `{COST_TABLE_REF}`.
-- Якщо запит про revenue/дохід — використовуй таблицю `{REVENUE_TABLE_REF}`.
-- Для агрегатів завжди став alias (не допускай f0_).
+- Якщо запит про revenue, дохід, GMV — використовуй таблицю `{REVENUE_TABLE_REF}`.
+- Для агрегатів (SUM, AVG, COUNT, тощо) завжди став alias, наприклад: SELECT SUM(revenue) AS value.
+- Не залишай SELECT SUM(...) без alias, щоб назва колонки не була f0_.
+- Використовуй тільки BigQuery SQL.
 - Не використовуй STRFTIME.
 - Використовуй CURRENT_DATE('{LOCAL_TZ}').
-- Не пиши ORDER BY у window функціях, крім LAG/LEAD.
-- Поверни лише SQL без Markdown.
+- Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
+- Поверни лише SQL без пояснень і без Markdown.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -335,7 +312,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if df.empty:
         return "Результат порожній."
 
-    # If single unnamed f0_ → rename to value
+    # Якщо BigQuery повернув одну колонку з ім'ям f0_, перейменуємо її в 'value',
+    # щоб аналіз виглядав адекватно.
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
 
@@ -374,3 +352,29 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX WINDOW ORDER BY ERRORS
+# ──────────────────────────────────────────────────────────────────────────────
+def fix_window_order_by(sql: str) -> str:
+    """
+    Обробка window-функцій:
+    - Якщо всередині OVER(...) є ORDER BY і немає LAG/LEAD → видаляємо ORDER BY
+    - Якщо використовується LAG/LEAD → залишаємо ORDER BY (BigQuery його вимагає)
+    Звичайний ORDER BY у кінці запиту не чіпаємо.
+    """
+
+    def _fix(match: re.Match) -> str:
+        over_clause = match.group(0)
+
+        # Якщо у вікні використовується LAG/LEAD — не чіпаємо
+        if re.search(r"\bLAG\s*$begin:math:text$\|\\bLEAD\\s\*\\\(\"\, over\_clause\, flags\=re\.IGNORECASE\)\:
+            return over\_clause
+
+        \# Прибираємо ORDER BY усередині OVER\(\.\.\.\)
+        cleaned \= re\.sub\(r\"ORDER\\s\+BY\[\^\)\]\*\"\, \"\"\, over\_clause\, flags\=re\.IGNORECASE\)
+        return cleaned
+
+    \# Застосувати до всіх OVER\(\.\.\.\)
+    return re\.sub\(r\"OVER\\s\*\\\(\[\^\)\]\*$end:math:text$", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
