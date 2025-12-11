@@ -338,12 +338,73 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if df.empty:
         return "Результат порожній."
 
-    # Якщо BigQuery повернув одну колонку з ім'ям f0_, перейменуємо її в 'value',
-    # щоб аналіз виглядав адекватно.
+    # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
 
-    # FINISH → Vertex analysis
+    # ======================================================================
+    # TABLE RENDER (MARKDOWN)
+    # ======================================================================
+    def render_table(df: pd.DataFrame) -> str:
+        col_widths = {
+            col: max(df[col].astype(str).map(len).max(), len(col))
+            for col in df.columns
+        }
+
+        header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
+        separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append("| " + " | ".join(f"{str(row[col]):{col_widths[col]}}" for col in df.columns) + " |")
+
+        return "\n".join([header, separator] + rows)
+
+    # ======================================================================
+    # ASCII CHART
+    # ======================================================================
+    def render_ascii_chart(df: pd.DataFrame) -> str:
+        import numpy as np
+
+        # numeric value column
+        num_cols = df.select_dtypes(include=["float", "int"]).columns
+        if len(num_cols) == 0:
+            return ""
+
+        val_col = num_cols[0]
+
+        # date-like label column
+        date_cols = [c for c in df.columns if "date" in c.lower() or "month" in c.lower()]
+        if len(date_cols) == 0:
+            date_cols = [df.columns[0]]
+
+        x_col = date_cols[0]
+
+        values = df[val_col].fillna(0).tolist()
+        labels = df[x_col].astype(str).tolist()
+
+        max_len = 40
+        max_val = max(values) if max(values) > 0 else 1
+
+        lines = ["📈 *ASCII графік*"]
+        for label, val in zip(labels, values):
+            bar_len = int((val / max_val) * max_len)
+            bar = "█" * bar_len
+            lines.append(f"{label:10} | {bar} {val}")
+
+        return "\n".join(lines)
+
+    # ======================================================================
+    # Compose final Slack message
+    # ======================================================================
+    table_md = render_table(df)
+    ascii_md = render_ascii_chart(df)
+
+    final_display = f"```\n{table_md}\n```\n{ascii_md}"
+
+    # ======================================================================
+    # Vertex analysis — unchanged
+    # ======================================================================
     analysis_prompt = f"""
 Проаналізуй результат CSV нижче:
 
@@ -354,11 +415,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
 Зроби короткий висновок (3–4 речення).
 """
-
     resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
-    return resp.text.strip()
 
-
+    return final_display + "\n\n" + resp.text.strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY
 # ──────────────────────────────────────────────────────────────────────────────
