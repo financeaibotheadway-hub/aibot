@@ -1,73 +1,65 @@
-# aibot/analytics/trend_analysis.py
+# analytics/trend_analysis.py
 # -*- coding: utf-8 -*-
 
-from .metric_parser import detect_metric
-from .period_parser import extract_period
-from .metric_loader import get_metrics
+import logging
+import os
+import pandas as pd
 from google.cloud import bigquery
-from ai_core.config import (
-    BQ_PROJECT,
-    BQ_DATASET,
-    BQ_REVENUE_TABLE,
-    BQ_COST_TABLE,
-)
+
+# Нові імпорти — ТІЛЬКИ наші
+from analytics.metric_loader import get_metrics
+from analytics.metric_parser import detect_metric
+
+logger = logging.getLogger(__name__)
 
 
-def answer_trend_question(message: str, kind: str) -> str:
+# ───────────────────────────────────────────────
+# ENV
+# ───────────────────────────────────────────────
+BQ_PROJECT       = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
+BQ_DATASET       = os.getenv("BQ_DATASET", "uploads")
+BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
+BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
+
+bq_client = bigquery.Client(project=BQ_PROJECT)
+
+
+# ───────────────────────────────────────────────
+# SIMPLE TREND CALCULATOR
+# ───────────────────────────────────────────────
+def run_trend_analysis(df: pd.DataFrame, metric: str) -> str:
     """
-    Головна функція, яку викликає analytics_core.
+    Проста аналітика трендів:
+    - визначаємо зростання/падіння
+    - даємо коротке пояснення
+
+    df — результат виконання SQL
+    metric — якої метрики стосується запит
     """
 
-    if kind == "trend_root_cause":
-        return "Root-cause аналіз скоро буде доступний."
+    if df.empty or metric not in df.columns:
+        return f"Не можу виконати тренд-аналіз для метрики: {metric}"
 
-    if kind == "trend_compare":
-        return run_trend_compare(message)
+    try:
+        values = df[metric].dropna().astype(float)
+        if len(values) < 2:
+            return "Недостатньо даних для аналізу тренду."
 
-    return run_trend_analysis(message)
+        diff = values.iloc[-1] - values.iloc[-2]
+        pct = (diff / values.iloc[-2]) * 100 if values.iloc[-2] != 0 else 0
 
+        if diff > 0:
+            trend = "📈 Зростання"
+        elif diff < 0:
+            trend = "📉 Падіння"
+        else:
+            trend = "➖ Без змін"
 
-def run_trend_analysis(message: str) -> str:
-    """
-    Реальний трендовий аналіз: визначає метрику, період, будує SQL.
-    """
-
-    metric = detect_metric(message)
-
-    if not metric:
-        available = ", ".join(get_metrics()[:20])
         return (
-            "Я не зміг визначити метрику у запиті.\n"
-            "Скажи, будь ласка, що аналізувати — opex, revenue, cost, sales?\n\n"
-            f"Доступні поля: {available} ..."
+            f"{trend} метрики **{metric}**: "
+            f"{diff:.2f} ({pct:.1f}%)\n"
+            f"Останні значення: {list(values.tail(5))}"
         )
-
-    period = extract_period(message)
-
-    sql = f"""
-        SELECT
-            date,
-            {metric} AS metric_value
-        FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_REVENUE_TABLE}`
-        WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL {period} DAY)
-        ORDER BY date
-    """
-
-    client = bigquery.Client()
-    df = client.query(sql).to_dataframe()
-
-    if df.empty:
-        return f"Даних по '{metric}' за період не знайдено."
-
-    latest = df.metric_value.iloc[-1]
-    trend = df.metric_value.pct_change().iloc[-1] * 100
-
-    return (
-        f"Метрика **{metric}** за останні {period} днів:\n\n"
-        f"• Поточне значення: {latest:,.2f}\n"
-        f"• Зміна до попереднього дня: {trend:,.1f}%"
-    )
-
-
-def run_trend_compare(message: str) -> str:
-    return "Функція порівняння періодів ще в розробці."
+    except Exception as e:
+        logger.error("Trend analysis failed: %s", e)
+        return "Помилка тренд-аналізу."
