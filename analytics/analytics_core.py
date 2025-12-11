@@ -254,6 +254,10 @@ def generate_sql(instruction_part: str, smap) -> str:
 
 {metric_hint}
 
+Повні назви таблиць:
+REVENUE_TABLE = `{REVENUE_TABLE_REF}`
+COST_TABLE    = `{COST_TABLE_REF}`
+
 Доступні поля:
 {metrics}
 
@@ -264,7 +268,8 @@ def generate_sql(instruction_part: str, smap) -> str:
 {json.dumps(cost_schema, indent=2)}
 
 Правила:
-- Якщо запит про "opex", "cost", "витрати", "спенд" — використовуй таблицю COST.
+- Якщо запит про "opex", "cost", "витрати", "спенд" — використовуй таблицю `{COST_TABLE_REF}`.
+- Якщо запит про revenue, дохід, GMV — використовуй таблицю `{REVENUE_TABLE_REF}`.
 - Використовуй тільки BigQuery SQL.
 - Не використовуй STRFTIME.
 - Використовуй CURRENT_DATE('{LOCAL_TZ}').
