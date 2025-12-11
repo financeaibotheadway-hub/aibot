@@ -135,11 +135,26 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_window_order_by(sql: str) -> str:
     """
-    Видаляємо ORDER BY всередині OVER(...), бо BigQuery ламається на виразах.
-    Звичайний ORDER BY в кінці запиту ми НЕ чіпаємо.
+    Обробка window-функцій:
+    - якщо всередині OVER(...) є ORDER BY і немає LAG/LEAD → прибираємо ORDER BY
+    - якщо використовується LAG/LEAD → залишаємо ORDER BY (BigQuery його вимагає)
+    Звичайний ORDER BY в кінці запиту не чіпаємо.
     """
-    pattern = r"(OVER\s*\([^)]*)ORDER\s+BY[^)]*(\))"
-    return re.sub(pattern, r"\1\2", sql, flags=re.IGNORECASE | re.DOTALL)
+
+    def _fix_over_clause(match):
+        over_clause = match.group(0)
+
+        # Якщо це вікно для LAG/LEAD — не чіпаємо
+        if re.search(r"\bLAG\s*$begin:math:text$\|\\bLEAD\\s\*\\\(\"\, over\_clause\, flags\=re\.IGNORECASE\)\:
+            return over\_clause
+
+        \# Прибираємо ORDER BY усередині OVER\(\.\.\.\)
+        cleaned \= re\.sub\(r\"ORDER\\s\+BY\[\^\)\]\*\"\, \"\"\, over\_clause\, flags\=re\.IGNORECASE\)
+        return cleaned
+
+    \# Шукаємо всі фрагменти \"OVER \( \.\.\. \)\"
+    pattern \= r\"OVER\\s\*\\\(\[\^\)\]\*$end:math:text$"
+    return re.sub(pattern, _fix_over_clause, sql, flags=re.IGNORECASE | re.DOTALL)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -217,7 +232,7 @@ def split_into_separate_queries(message: str) -> list:
         out = []
         for ln in lines:
             if ln.startswith("ЗАПИТ_"):
-                q = ln.split(":")[1].strip()
+                q = ln.split(":", 1)[1].strip()
                 out.append(q)
         return out if out else [message]
     except:
@@ -240,8 +255,10 @@ def generate_sql(instruction_part: str, smap) -> str:
     metric_hint = f"\nВизначена метрика: {metric}\n" if metric else ""
 
     rev_schema, cost_schema = get_all_schemas()
-
     date_cols = _collect_date_columns(rev_schema) | _collect_date_columns(cost_schema)
+
+    rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
+    cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
 
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання:
@@ -254,8 +271,14 @@ def generate_sql(instruction_part: str, smap) -> str:
 REVENUE_TABLE = `{REVENUE_TABLE_REF}`
 COST_TABLE    = `{COST_TABLE_REF}`
 
-Доступні поля:
+Доступні поля (метрики):
 {metrics}
+
+Стовпці таблиці REVENUE (реальні назви колонок):
+{rev_cols}
+
+Стовпці таблиці COST (реальні назви колонок):
+{cost_cols}
 
 Схема REVENUE:
 {json.dumps(rev_schema, indent=2)}
@@ -264,13 +287,16 @@ COST_TABLE    = `{COST_TABLE_REF}`
 {json.dumps(cost_schema, indent=2)}
 
 Правила:
+- Використовуй ТІЛЬКИ ті поля, які є в списках колонок вище. Не вигадуй нових полів (наприклад, event_type), якщо їх немає в схемі.
 - Якщо запит про "opex", "cost", "витрати", "спенд" — використовуй таблицю `{COST_TABLE_REF}`.
 - Якщо запит про revenue, дохід, GMV — використовуй таблицю `{REVENUE_TABLE_REF}`.
+- Для агрегатів (SUM, AVG, COUNT, тощо) завжди став alias, наприклад: SELECT SUM(revenue) AS value.
+- Не залишай SELECT SUM(...) без alias, щоб назва колонки не була f0_.
 - Використовуй тільки BigQuery SQL.
 - Не використовуй STRFTIME.
 - Використовуй CURRENT_DATE('{LOCAL_TZ}').
-- Не пиши ORDER BY у window функціях.
-- Поверни лише SQL.
+- Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
+- Поверни лише SQL без пояснень і без Markdown.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -308,6 +334,11 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if df.empty:
         return "Результат порожній."
 
+    # Якщо BigQuery повернув одну колонку з ім'ям f0_, перейменуємо її в 'value',
+    # щоб аналіз виглядав адекватно.
+    if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
+        df = df.rename(columns={df.columns[0]: "value"})
+
     # FINISH → Vertex analysis
     analysis_prompt = f"""
 Проаналізуй результат CSV нижче:
@@ -343,4 +374,3 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
-
