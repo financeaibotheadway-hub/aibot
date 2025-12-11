@@ -108,16 +108,21 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
-        sql_query, flags=re.IGNORECASE)
+        sql_query,
+        flags=re.IGNORECASE,
+    )
 
     sql_query = re.sub(
         r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
-        sql_query, flags=re.IGNORECASE)
+        sql_query,
+        flags=re.IGNORECASE,
+    )
 
     # Remove PARSE_DATE around existing DATE fields
     for col in date_columns:
         p1 = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+
         def repl1(m):
             inner = m.group(1)
             clean = inner.strip("`")
@@ -136,15 +141,15 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 def fix_window_order_by(sql: str) -> str:
     """
     Обробка window-функцій:
-    - якщо всередині OVER(...) є ORDER BY і немає LAG/LEAD → прибираємо ORDER BY
-    - якщо використовується LAG/LEAD → залишаємо ORDER BY (BigQuery його вимагає)
-    Звичайний ORDER BY в кінці запиту не чіпаємо.
+    - Якщо всередині OVER(...) є ORDER BY і немає LAG/LEAD → видаляємо ORDER BY
+    - Якщо використовується LAG/LEAD → залишаємо ORDER BY (BigQuery його вимагає)
+    Звичайний ORDER BY у кінці запиту не чіпаємо.
     """
 
-    def _fix_over_clause(match):
+    def _fix(match):
         over_clause = match.group(0)
 
-        # Якщо це вікно для LAG/LEAD — не чіпаємо
+        # Якщо у вікні LAG/LEAD — нічого не змінюємо
         if re.search(r"\bLAG\s*$begin:math:text$\|\\bLEAD\\s\*\\\(\"\, over\_clause\, flags\=re\.IGNORECASE\)\:
             return over\_clause
 
@@ -152,9 +157,8 @@ def fix_window_order_by(sql: str) -> str:
         cleaned \= re\.sub\(r\"ORDER\\s\+BY\[\^\)\]\*\"\, \"\"\, over\_clause\, flags\=re\.IGNORECASE\)
         return cleaned
 
-    \# Шукаємо всі фрагменти \"OVER \( \.\.\. \)\"
-    pattern \= r\"OVER\\s\*\\\(\[\^\)\]\*$end:math:text$"
-    return re.sub(pattern, _fix_over_clause, sql, flags=re.IGNORECASE | re.DOTALL)
+    \# Застосувати до всіх OVER\(\.\.\.\)
+    return re\.sub\(r\"OVER\\s\*\\\(\[\^\)\]\*$end:math:text$", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,7 +209,7 @@ def find_matches_with_ai_cached(instruction: str, smap_json: str):
                 f, v = part.strip().split(":", 1)
                 out.append((f, v))
         return out
-    except:
+    except Exception:
         return []
 
 
@@ -235,7 +239,7 @@ def split_into_separate_queries(message: str) -> list:
                 q = ln.split(":", 1)[1].strip()
                 out.append(q)
         return out if out else [message]
-    except:
+    except Exception:
         return [message]
 
 
