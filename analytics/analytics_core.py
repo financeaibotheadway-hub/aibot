@@ -136,6 +136,32 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# FIX WINDOW ORDER BY ERRORS
+# ──────────────────────────────────────────────────────────────────────────────
+def fix_window_order_by(sql: str) -> str:
+    """
+    Обробка window-функцій:
+    - Якщо всередині OVER(...) використовується LAG/LEAD → нічого не змінюємо
+    - Якщо є ORDER BY всередині OVER(...) → видаляємо його
+    Звичайний ORDER BY у кінці запиту не чіпаємо.
+    """
+
+    def _fix(match):
+        over_clause = match.group(0)
+
+        # Якщо у вікні використовується LAG/LEAD — залишаємо все як є
+        if re.search(r"\bLAG\s*\(|\bLEAD\s*\(", over_clause, flags=re.IGNORECASE):
+            return over_clause
+
+        # Прибираємо ORDER BY усередині OVER(...)
+        cleaned = re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
+        return cleaned
+
+    # Застосувати до всіх OVER(...)
+    return re.sub(r"OVER\s*\([^\)]*\)", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_cached_query(sql_query: str):
@@ -352,29 +378,3 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FIX WINDOW ORDER BY ERRORS
-# ──────────────────────────────────────────────────────────────────────────────
-def fix_window_order_by(sql: str) -> str:
-    """
-    Обробка window-функцій:
-    - Якщо всередині OVER(...) є ORDER BY і немає LAG/LEAD → видаляємо ORDER BY
-    - Якщо використовується LAG/LEAD → залишаємо ORDER BY (BigQuery його вимагає)
-    Звичайний ORDER BY у кінці запиту не чіпаємо.
-    """
-
-    def _fix(match: re.Match) -> str:
-        over_clause = match.group(0)
-
-        # Якщо у вікні використовується LAG/LEAD — не чіпаємо
-        if re.search(r"\bLAG\s*$begin:math:text$\|\\bLEAD\\s\*\\\(\"\, over\_clause\, flags\=re\.IGNORECASE\)\:
-            return over\_clause
-
-        \# Прибираємо ORDER BY усередині OVER\(\.\.\.\)
-        cleaned \= re\.sub\(r\"ORDER\\s\+BY\[\^\)\]\*\"\, \"\"\, over\_clause\, flags\=re\.IGNORECASE\)
-        return cleaned
-
-    \# Застосувати до всіх OVER\(\.\.\.\)
-    return re\.sub\(r\"OVER\\s\*\\\(\[\^\)\]\*$end:math:text$", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
