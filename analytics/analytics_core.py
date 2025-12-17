@@ -174,7 +174,75 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     return sql_query
 
+# ──────────────────────────────────────────────────────────────────────────────
+# GROWTH QUERY DETECTOR (UNIVERSAL)
+# ──────────────────────────────────────────────────────────────────────────────
+def is_month_over_month_growth_query(text: str) -> bool:
+    t = text.lower()
 
+    growth_tokens = [
+        "зрос", "зрост", "increase", "grew", "growth", "rise", "delta"
+    ]
+
+    time_tokens = [
+        "місяц", "month", "monthly"
+    ]
+
+    return any(g in t for g in growth_tokens) and any(m in t for m in time_tokens)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UNIVERSAL MONTH GROWTH SQL BUILDER
+# ──────────────────────────────────────────────────────────────────────────────
+def build_month_growth_sql(
+    table_ref: str,
+    date_col: str,
+    value_expr: str,
+    where_clause: str | None = None,
+    return_first_only: bool = True
+) -> str:
+
+    where_sql = f"\nWHERE {where_clause}" if where_clause else ""
+
+    limit_sql = "LIMIT 1" if return_first_only else ""
+
+    return f"""
+WITH monthly AS (
+  SELECT
+    DATE_TRUNC({date_col}, MONTH) AS month,
+    {value_expr} AS value
+  FROM `{table_ref}`
+  {where_sql}
+  GROUP BY 1
+),
+diffs AS (
+  SELECT
+    month,
+    value,
+    LAG(value) OVER (ORDER BY month) AS prev_value
+  FROM monthly
+),
+growth AS (
+  SELECT
+    month,
+    value,
+    prev_value,
+    value - prev_value AS diff,
+    SAFE_DIVIDE(value - prev_value, prev_value) * 100 AS growth_pct
+  FROM diffs
+  WHERE prev_value IS NOT NULL
+)
+SELECT
+  month,
+  value,
+  prev_value,
+  diff,
+  growth_pct
+FROM growth
+WHERE diff > 0
+ORDER BY month
+{limit_sql}
+""".strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -318,10 +386,37 @@ def split_into_separate_queries(message: str) -> list:
 # SQL GENERATOR + METRIC PARSER INTEGRATION
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_sql(instruction_part: str, smap) -> str:
-    """
-    Тут ми вставляємо metric_parser.detect_metric + metric_loader.get_metrics
-    і даємо SQL-генерації підказку з метрикою.
-    """
+    # ──────────────────────────────────────────────────────────
+    # HARD LOGIC: Month-over-Month Growth (NO LLM)
+    # ──────────────────────────────────────────────────────────
+    if is_month_over_month_growth_query(instruction_part):
+
+        metric = detect_metric(instruction_part)
+
+        # COST / OPEX
+        if metric and metric.get("table") == "cost":
+            return build_month_growth_sql(
+                table_ref=COST_TABLE_REF,
+                date_col="date",
+                value_expr="SUM(cost)",
+                where_clause=metric.get("where")
+            )
+
+        # REVENUE / SALES
+        if metric and metric.get("table") == "revenue":
+            return build_month_growth_sql(
+                table_ref=REVENUE_TABLE_REF,
+                date_col="date",
+                value_expr="SUM(revenue)",
+                where_clause=metric.get("where")
+            )
+
+        # fallback — safe default
+        return build_month_growth_sql(
+            table_ref=COST_TABLE_REF,
+            date_col="date",
+            value_expr="SUM(cost)"
+        )
 
     # 1. Детекція метрики
     metric = detect_metric(instruction_part)
