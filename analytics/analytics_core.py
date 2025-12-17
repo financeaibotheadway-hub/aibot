@@ -121,6 +121,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     Normalize dates for BigQuery:
     - CURRENT_DATE / CURRENT_DATE() → CURRENT_DATE('TZ')
     - Remove PARSE_DATE around real DATE columns
+    - Fix placeholder dates like 'YYYY-MM-01'
     - Wrap naked 'YYYY-MM-DD' literals into DATE(...)
     """
 
@@ -152,13 +153,30 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
             inner = m.group(1)
             clean = inner.strip("`")
             if clean == col or clean.endswith(f".{col}"):
-                return inner  # already DATE column
+                return inner
             return m.group(0)
 
         sql_query = re.sub(pattern, _unwrap_parse_date, sql_query, flags=re.IGNORECASE)
 
     # ──────────────────────────────────────────────────────────────
-    # Fix naked 'YYYY-MM-DD' → DATE('YYYY-MM-DD')
+    # 🔥 FIX PLACEHOLDER 'YYYY-MM-DD'
+    # ──────────────────────────────────────────────────────────────
+    sql_query = re.sub(
+        r"'YYYY-MM-(\d{2})'",
+        rf"""DATE(
+            CONCAT(
+                EXTRACT(YEAR FROM CURRENT_DATE('{LOCAL_TZ}')),
+                '-',
+                LPAD(EXTRACT(MONTH FROM CURRENT_DATE('{LOCAL_TZ}')), 2, '0'),
+                '-\1'
+            )
+        )""",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
+    # ──────────────────────────────────────────────────────────────
+    # Fix real '2024-03-01' → DATE('2024-03-01')
     # ──────────────────────────────────────────────────────────────
     sql_query = re.sub(
         r"(?<!DATE\()\b'(\d{4}-\d{2}-\d{2})'\b",
@@ -187,10 +205,7 @@ def fix_window_order_by(sql: str) -> str:
 
         # ✅ LAG / LEAD without ORDER BY → add safe ORDER BY
         if has_lag_lead and not has_order_by:
-            return over_clause.replace(
-                ")",
-                " ORDER BY 1)"
-            )
+            return over_clause.rstrip(")") + " ORDER BY 1)"
 
         # ❌ Non LAG/LEAD → remove ORDER BY
         if not has_lag_lead and has_order_by:
@@ -199,7 +214,7 @@ def fix_window_order_by(sql: str) -> str:
         return over_clause
 
     return re.sub(
-        r"OVER\s*\([^\)]*\)",
+        r"OVER\s*\((?:[^()]|\([^()]*\))*\)",
         _fix,
         sql,
         flags=re.IGNORECASE | re.DOTALL
@@ -355,6 +370,14 @@ COST_TABLE    = `{COST_TABLE_REF}`
 
     # ✨ Fix window functions (LAG/LEAD order issues)
     sql = fix_window_order_by(sql)
+
+    # 🔥 FINAL SAFETY-NET: force ORDER BY for any remaining LAG/LEAD
+    sql = re.sub(
+        r"(LAG|LEAD)\s*\(([^)]*)\)\s*OVER\s*\((?![^)]*ORDER\s+BY)([^)]*)\)",
+        r"\1(\2) OVER (\3 ORDER BY 1)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
     # ✨ Fix dates and casts
     sql = _sanitize_sql_dates(sql, date_cols)
