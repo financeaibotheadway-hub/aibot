@@ -90,6 +90,20 @@ def get_all_schemas():
 # >>> preload
 _ = get_all_schemas()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM SQL SANITIZER
+# ──────────────────────────────────────────────────────────────────────────────
+def sanitize_llm_sql(sql: str) -> str:
+    sql = sql.strip()
+
+    # remove markdown fences
+    sql = re.sub(r"```(sql|bigquery)?", "", sql, flags=re.IGNORECASE)
+    sql = sql.replace("```", "")
+
+    # remove accidental 'bigquery' token at start
+    sql = re.sub(r"(?i)^\s*bigquery\s*", "", sql)
+
+    return sql.strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DATE TOOLS
@@ -103,8 +117,16 @@ def _collect_date_columns(schema_list):
 
 
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
-    sql_original = sql_query
+    """
+    Normalize dates for BigQuery:
+    - CURRENT_DATE / CURRENT_DATE() → CURRENT_DATE('TZ')
+    - Remove PARSE_DATE around real DATE columns
+    - Wrap naked 'YYYY-MM-DD' literals into DATE(...)
+    """
 
+    # ──────────────────────────────────────────────────────────────
+    # CURRENT_DATE()
+    # ──────────────────────────────────────────────────────────────
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -112,6 +134,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
+    # CURRENT_DATE without ()
     sql_query = re.sub(
         r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -119,18 +142,29 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Remove PARSE_DATE around existing DATE fields
+    # ──────────────────────────────────────────────────────────────
+    # Remove PARSE_DATE around DATE columns
+    # ──────────────────────────────────────────────────────────────
     for col in date_columns:
-        p1 = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+        pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
 
-        def repl1(m):
+        def _unwrap_parse_date(m):
             inner = m.group(1)
             clean = inner.strip("`")
-            if clean.endswith(f".{col}") or clean == col:
-                return inner
+            if clean == col or clean.endswith(f".{col}"):
+                return inner  # already DATE column
             return m.group(0)
 
-        sql_query = re.sub(p1, repl1, sql_query, flags=re.IGNORECASE)
+        sql_query = re.sub(pattern, _unwrap_parse_date, sql_query, flags=re.IGNORECASE)
+
+    # ──────────────────────────────────────────────────────────────
+    # Fix naked 'YYYY-MM-DD' → DATE('YYYY-MM-DD')
+    # ──────────────────────────────────────────────────────────────
+    sql_query = re.sub(
+        r"(?<!DATE\()\b'(\d{4}-\d{2}-\d{2})'\b",
+        r"DATE('\1')",
+        sql_query,
+    )
 
     return sql_query
 
@@ -140,25 +174,36 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_window_order_by(sql: str) -> str:
     """
-    Обробка window-функцій:
-    - Якщо всередині OVER(...) використовується LAG/LEAD → нічого не змінюємо
-    - Якщо є ORDER BY всередині OVER(...) → видаляємо його
-    Звичайний ORDER BY у кінці запиту не чіпаємо.
+    BigQuery rules:
+    - LAG / LEAD REQUIRE ORDER BY inside OVER(...)
+    - Other window functions MUST NOT have ORDER BY
     """
 
     def _fix(match):
         over_clause = match.group(0)
 
-        # Якщо у вікні використовується LAG/LEAD — залишаємо все як є
-        if re.search(r"\bLAG\s*\(|\bLEAD\s*\(", over_clause, flags=re.IGNORECASE):
-            return over_clause
+        has_lag_lead = re.search(r"\b(LAG|LEAD)\s*\(", over_clause, re.IGNORECASE)
+        has_order_by = re.search(r"\bORDER\s+BY\b", over_clause, re.IGNORECASE)
 
-        # Прибираємо ORDER BY усередині OVER(...)
-        cleaned = re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
-        return cleaned
+        # ✅ LAG / LEAD without ORDER BY → add safe ORDER BY
+        if has_lag_lead and not has_order_by:
+            return over_clause.replace(
+                ")",
+                " ORDER BY 1)"
+            )
 
-    # Застосувати до всіх OVER(...)
-    return re.sub(r"OVER\s*\([^\)]*\)", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
+        # ❌ Non LAG/LEAD → remove ORDER BY
+        if not has_lag_lead and has_order_by:
+            return re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
+
+        return over_clause
+
+    return re.sub(
+        r"OVER\s*\([^\)]*\)",
+        _fix,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -304,10 +349,14 @@ COST_TABLE    = `{COST_TABLE_REF}`
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
-    sql = resp.text.strip()
-    sql = sql.replace("```sql", "").replace("```", "").strip()
 
+    # ✨ Sanitize raw LLM output first
+    sql = sanitize_llm_sql(resp.text)
+
+    # ✨ Fix window functions (LAG/LEAD order issues)
     sql = fix_window_order_by(sql)
+
+    # ✨ Fix dates and casts
     sql = _sanitize_sql_dates(sql, date_cols)
 
     return sql
