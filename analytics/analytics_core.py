@@ -184,46 +184,74 @@ def _sanitize_division_by_zero(sql_query: str) -> str:
     Rewrites:
       a / b  -> SAFE_DIVIDE(a, b)
 
-    This prevents 'division by zero' runtime errors for MoM/YoY percent calculations.
+    Guarantees:
+    - does NOT touch string literals
+    - does NOT touch timezone identifiers (Europe/Kyiv)
+    - does NOT touch DATE / TIMESTAMP / CURRENT_DATE(...)
     """
 
-    # protect already-safe cases
-    if "SAFE_DIVIDE" in sql_query.upper():
-        # still continue; we only rewrite plain "/" patterns
-        pass
+    protected = {}
 
-    # Very common patterns from LLM:
-    #   (x - y) / y
-    #   x / y
-    # We'll rewrite simple binary divisions where denominator is a single token/expression.
-    # NOTE: This is heuristic, but works well for generated analytics SQL.
+    def _protect(m):
+        key = f"__PROTECTED_{len(protected)}__"
+        protected[key] = m.group(0)
+        return key
+
+    # 1️⃣ Protect string literals FIRST  → 'Europe/Kyiv'
+    sql_query = re.sub(
+        r"'[^']*'",
+        _protect,
+        sql_query
+    )
+
+    # 2️⃣ Protect timezone identifiers WITHOUT quotes (defensive)
+    # Europe/Kyiv, America/New_York, etc
+    sql_query = re.sub(
+        r"\b[A-Za-z]+\/[A-Za-z_]+\b",
+        _protect,
+        sql_query
+    )
+
+    # 3️⃣ Protect date/time functions COMPLETELY
+    sql_query = re.sub(
+        r"\b(CURRENT_DATE|DATE|TIMESTAMP|DATETIME)\s*\([^)]*\)",
+        _protect,
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
+    # 4️⃣ Replace ONLY real numeric / column divisions
     pattern = re.compile(
         r"""
         (?P<num>
-            \([^()]+\)                 # ( ... )  simple paren expr
+            \([^()]+\)
             |
-            [A-Za-z_][\w\.]*           # identifier
+            [A-Za-z_][\w\.]*
             |
-            \d+(?:\.\d+)?              # number
+            \d+(?:\.\d+)?
         )
         \s*/\s*
         (?P<den>
-            \([^()]+\)                 # ( ... )
+            \([^()]+\)
             |
-            [A-Za-z_][\w\.]*           # identifier
+            [A-Za-z_][\w\.]*
             |
-            \d+(?:\.\d+)?              # number
+            \d+(?:\.\d+)?
         )
         """,
         re.VERBOSE,
     )
 
-    def _repl(m: re.Match) -> str:
-        num = m.group("num").strip()
-        den = m.group("den").strip()
-        return f"SAFE_DIVIDE({num}, {den})"
+    sql_query = pattern.sub(
+        lambda m: f"SAFE_DIVIDE({m.group('num')}, {m.group('den')})",
+        sql_query,
+    )
 
-    return pattern.sub(_repl, sql_query)
+    # 5️⃣ Restore protected fragments
+    for k, v in protected.items():
+        sql_query = sql_query.replace(k, v)
+
+    return sql_query
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -404,6 +432,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     sql = sql.replace("```sql", "").replace("```", "").strip()
+    sql = re.sub(r"^\s*(bigquery|BigQuery|BigQuery SQL)\s*[:\-]*", "", sql, flags=re.IGNORECASE)
 
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
