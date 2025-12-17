@@ -125,9 +125,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     - Wrap naked 'YYYY-MM-DD' literals into DATE(...)
     """
 
-    # ──────────────────────────────────────────────────────────────
     # CURRENT_DATE()
-    # ──────────────────────────────────────────────────────────────
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -143,9 +141,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # ──────────────────────────────────────────────────────────────
     # Remove PARSE_DATE around DATE columns
-    # ──────────────────────────────────────────────────────────────
     for col in date_columns:
         pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
 
@@ -158,26 +154,18 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
         sql_query = re.sub(pattern, _unwrap_parse_date, sql_query, flags=re.IGNORECASE)
 
-    # ──────────────────────────────────────────────────────────────
-    # 🔥 FIX PLACEHOLDER 'YYYY-MM-DD'
-    # ──────────────────────────────────────────────────────────────
-    sql_query = re.sub(
-        r"'YYYY-MM-(\d{2})'",
-        rf"""DATE(
-            CONCAT(
-                EXTRACT(YEAR FROM CURRENT_DATE('{LOCAL_TZ}')),
-                '-',
-                LPAD(EXTRACT(MONTH FROM CURRENT_DATE('{LOCAL_TZ}')), 2, '0'),
-                '-\1'
-            )
-        )""",
-        sql_query,
-        flags=re.IGNORECASE,
-    )
+    # ✅ FIX placeholder 'YYYY-MM-DD' (no LPAD!)
+    def _ph_date_repl(m):
+        day = int(m.group(1))
+        # first day of current month + (day-1)
+        if day <= 1:
+            return f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)"
+        return f"DATE_ADD(DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH), INTERVAL {day-1} DAY)"
 
-    # ──────────────────────────────────────────────────────────────
-    # Fix real '2024-03-01' → DATE('2024-03-01')
-    # ──────────────────────────────────────────────────────────────
+    # catches 'YYYY-MM-01', 'YYYY-MM-15', etc
+    sql_query = re.sub(r"(?i)\b'YYYY-MM-(\d{2})'\b", _ph_date_repl, sql_query)
+
+    # Wrap real '2024-03-01' → DATE('2024-03-01')
     sql_query = re.sub(
         r"(?<!DATE\()\b'(\d{4}-\d{2}-\d{2})'\b",
         r"DATE('\1')",
@@ -192,33 +180,56 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_window_order_by(sql: str) -> str:
     """
-    BigQuery rules:
-    - LAG / LEAD REQUIRE ORDER BY inside OVER(...)
-    - Other window functions MUST NOT have ORDER BY
+    Only fix LAG/LEAD: ensure OVER(...) contains ORDER BY.
+    Do NOT remove ORDER BY from other window functions (BigQuery allows it).
     """
+    s = sql
+    pattern = re.compile(r"\b(LAG|LEAD)\s*\(", re.IGNORECASE)
 
-    def _fix(match):
-        over_clause = match.group(0)
+    i = 0
+    while True:
+        m = pattern.search(s, i)
+        if not m:
+            break
 
-        has_lag_lead = re.search(r"\b(LAG|LEAD)\s*\(", over_clause, re.IGNORECASE)
-        has_order_by = re.search(r"\bORDER\s+BY\b", over_clause, re.IGNORECASE)
+        # find "OVER" after this LAG/LEAD call
+        over_m = re.search(r"\bOVER\s*\(", s[m.end():], re.IGNORECASE)
+        if not over_m:
+            i = m.end()
+            continue
 
-        # ✅ LAG / LEAD without ORDER BY → add safe ORDER BY
-        if has_lag_lead and not has_order_by:
-            return over_clause.rstrip(")") + " ORDER BY 1)"
+        over_pos = m.end() + over_m.start()  # points to 'OVER'
+        paren_pos = s.find("(", over_pos)
+        if paren_pos == -1:
+            i = m.end()
+            continue
 
-        # ❌ Non LAG/LEAD → remove ORDER BY
-        if not has_lag_lead and has_order_by:
-            return re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
+        # extract balanced (...) after OVER(
+        depth = 0
+        j = paren_pos
+        while j < len(s):
+            if s[j] == "(":
+                depth += 1
+            elif s[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
 
-        return over_clause
+        if depth != 0:
+            i = m.end()
+            continue
 
-    return re.sub(
-        r"OVER\s*\((?:[^()]|\([^()]*\))*\)",
-        _fix,
-        sql,
-        flags=re.IGNORECASE | re.DOTALL
-    )
+        over_inner = s[paren_pos + 1 : j]
+        if not re.search(r"\bORDER\s+BY\b", over_inner, re.IGNORECASE):
+            # add ORDER BY 1 at the end of OVER(...)
+            new_inner = over_inner.rstrip() + " ORDER BY 1"
+            s = s[:paren_pos + 1] + new_inner + s[j:]
+            i = paren_pos + 1 + len(new_inner) + 1
+        else:
+            i = j + 1
+
+    return s
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -370,14 +381,6 @@ COST_TABLE    = `{COST_TABLE_REF}`
 
     # ✨ Fix window functions (LAG/LEAD order issues)
     sql = fix_window_order_by(sql)
-
-    # 🔥 FINAL SAFETY-NET: force ORDER BY for any remaining LAG/LEAD
-    sql = re.sub(
-        r"(LAG|LEAD)\s*\(([^)]*)\)\s*OVER\s*\((?![^)]*ORDER\s+BY)([^)]*)\)",
-        r"\1(\2) OVER (\3 ORDER BY 1)",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
 
     # ✨ Fix dates and casts
     sql = _sanitize_sql_dates(sql, date_cols)
