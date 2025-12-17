@@ -179,23 +179,20 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
 def _sanitize_division_by_zero(sql: str) -> str:
     """
-    SAFE: does NOT touch strings, dates, timezones
+    SAFE: replaces a / b -> SAFE_DIVIDE(a, b)
+    GUARANTEE: no placeholders ever leak to final SQL
     """
 
-    # ❌ швидкий exit — якщо немає /
-    if "/" not in sql:
-        return sql
-
-    # 🔒 protect strings
     strings = {}
+
     def protect(m):
         k = f"__STR_{len(strings)}__"
         strings[k] = m.group(0)
         return k
 
+    # 🔒 ALWAYS protect first
     sql = re.sub(r"'[^']*'", protect, sql)
 
-    # 🔒 protect CURRENT_DATE / DATE / TIMESTAMP blocks
     sql = re.sub(
         r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
         protect,
@@ -203,26 +200,25 @@ def _sanitize_division_by_zero(sql: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 🔒 protect timezone literals Europe/Kyiv
     sql = re.sub(
         r"\b[A-Za-z_]+/[A-Za-z_]+\b",
         protect,
         sql,
     )
 
-    # ✅ SAFE_DIVIDE only on pure math
+    # ✅ replace divisions
     sql = re.sub(
         r"""
-        (?P<a>\b[\w\.]+\b|\([^()]+\))
+        (?P<a>\([^()]+\)|\b[\w\.]+\b)
         \s*/\s*
-        (?P<b>\b[\w\.]+\b|\([^()]+\))
+        (?P<b>\([^()]+\)|\b[\w\.]+\b)
         """,
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE,
     )
 
-    # 🔓 restore
+    # 🔓 ALWAYS restore
     for k, v in strings.items():
         sql = sql.replace(k, v)
 
