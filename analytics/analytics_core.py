@@ -103,8 +103,18 @@ def _collect_date_columns(schema_list):
 
 
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
-    sql_original = sql_query
+    """
+    BigQuery-safe date sanitizer.
 
+    Fixes:
+    - CURRENT_DATE / CURRENT_DATE()
+    - 'YYYY-MM-01', 'YYYY-MM-DD' placeholders
+    - Removes PARSE_DATE around real DATE columns
+    """
+
+    # ─────────────────────────────────────────────
+    # CURRENT_DATE()
+    # ─────────────────────────────────────────────
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -112,6 +122,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
+    # CURRENT_DATE without ()
     sql_query = re.sub(
         r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -119,48 +130,75 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Remove PARSE_DATE around existing DATE fields
+    # ─────────────────────────────────────────────
+    # Remove PARSE_DATE around existing DATE columns
+    # ─────────────────────────────────────────────
     for col in date_columns:
-        p1 = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+        pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
 
-        def repl1(m):
+        def _unwrap(m):
             inner = m.group(1)
             clean = inner.strip("`")
-            if clean.endswith(f".{col}") or clean == col:
+            if clean == col or clean.endswith(f".{col}"):
                 return inner
             return m.group(0)
 
-        sql_query = re.sub(p1, repl1, sql_query, flags=re.IGNORECASE)
+        sql_query = re.sub(pattern, _unwrap, sql_query, flags=re.IGNORECASE)
+
+    # ─────────────────────────────────────────────
+    # YYYY-MM-DD placeholder → CURRENT_DATE
+    # ─────────────────────────────────────────────
+    sql_query = re.sub(
+        r"'YYYY-MM-DD'",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
+    # ─────────────────────────────────────────────
+    # YYYY-MM-01 placeholder → first day of current month
+    # ─────────────────────────────────────────────
+    sql_query = re.sub(
+        r"'YYYY-MM-01'",
+        f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
 
     return sql_query
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_window_order_by(sql: str) -> str:
     """
-    Обробка window-функцій:
-    - Якщо всередині OVER(...) використовується LAG/LEAD → нічого не змінюємо
-    - Якщо є ORDER BY всередині OVER(...) → видаляємо його
-    Звичайний ORDER BY у кінці запиту не чіпаємо.
+    BigQuery rules:
+    - LAG / LEAD REQUIRE ORDER BY inside OVER(...)
+    - Other window functions MUST NOT have ORDER BY
     """
 
     def _fix(match):
         over_clause = match.group(0)
 
-        # Якщо у вікні використовується LAG/LEAD — залишаємо все як є
-        if re.search(r"\bLAG\s*\(|\bLEAD\s*\(", over_clause, flags=re.IGNORECASE):
-            return over_clause
+        has_lag_lead = re.search(r"\b(LAG|LEAD)\s*\(", over_clause, re.IGNORECASE)
+        has_order_by = re.search(r"\bORDER\s+BY\b", over_clause, re.IGNORECASE)
 
-        # Прибираємо ORDER BY усередині OVER(...)
-        cleaned = re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
-        return cleaned
+        # ✅ LAG / LEAD without ORDER BY → add safe ORDER BY 1
+        if has_lag_lead and not has_order_by:
+            return over_clause[:-1] + " ORDER BY 1)"
 
-    # Застосувати до всіх OVER(...)
-    return re.sub(r"OVER\s*\([^\)]*\)", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
+        # ❌ Non LAG/LEAD → remove ORDER BY
+        if not has_lag_lead and has_order_by:
+            return re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
 
+        return over_clause
 
+    return re.sub(
+        r"OVER\s*\([^\)]*\)",
+        _fix,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
