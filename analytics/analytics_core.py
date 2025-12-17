@@ -177,74 +177,56 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     return sql_query
 
-def _sanitize_division_by_zero(sql_query: str) -> str:
-    protected = {}
+def _sanitize_division_by_zero(sql: str) -> str:
+    """
+    SAFE: does NOT touch strings, dates, timezones
+    """
 
-    def _protect(m):
-        key = f"__PROTECTED_{len(protected)}__"
-        protected[key] = m.group(0)
-        return key
+    # ❌ швидкий exit — якщо немає /
+    if "/" not in sql:
+        return sql
 
-    # 1️⃣ Protect STRING literals FIRST  ← 🔴 КРИТИЧНО
-    sql_query = re.sub(
-        r"'[^']*'",
-        _protect,
-        sql_query
+    # 🔒 protect strings
+    strings = {}
+    def protect(m):
+        k = f"__STR_{len(strings)}__"
+        strings[k] = m.group(0)
+        return k
+
+    sql = re.sub(r"'[^']*'", protect, sql)
+
+    # 🔒 protect CURRENT_DATE / DATE / TIMESTAMP blocks
+    sql = re.sub(
+        r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
+        protect,
+        sql,
+        flags=re.IGNORECASE,
     )
 
-    # 2️⃣ Protect AT TIME ZONE clauses (AT TIME ZONE Europe/Kyiv)
-    sql_query = re.sub(
-        r"\bAT\s+TIME\s+ZONE\s+[A-Za-z]+\/[A-Za-z_]+\b",
-        _protect,
-        sql_query,
-        flags=re.IGNORECASE
+    # 🔒 protect timezone literals Europe/Kyiv
+    sql = re.sub(
+        r"\b[A-Za-z_]+/[A-Za-z_]+\b",
+        protect,
+        sql,
     )
 
-    # 3️⃣ Protect timezone identifiers (Europe/Kyiv, America/New_York)
-    sql_query = re.sub(
-        # 3️⃣ Protect timezone identifiers (with or without spaces)
-    r"\b[A-Za-z_]+\s*/\s*[A-Za-z_]+\b",
-        _protect,
-        sql_query
-    )
-
-    # 4️⃣ Protect ALL date/time functions
-    sql_query = re.sub(
-        r"\b(CURRENT_DATE|DATE|TIMESTAMP|DATETIME)\s*\([^)]*\)",
-        _protect,
-        sql_query,
-        flags=re.IGNORECASE
-    )
-
-    # 5️⃣ Replace divisions ONLY after full protection
-    sql_query = re.sub(
+    # ✅ SAFE_DIVIDE only on pure math
+    sql = re.sub(
         r"""
-        (?P<num>
-            \([^()]+\)
-            |
-            [A-Za-z_][\w\.]*
-            |
-            \d+(?:\.\d+)?
-        )
+        (?P<a>\b[\w\.]+\b|\([^()]+\))
         \s*/\s*
-        (?P<den>
-            \([^()]+\)
-            |
-            [A-Za-z_][\w\.]*
-            |
-            \d+(?:\.\d+)?
-        )
+        (?P<b>\b[\w\.]+\b|\([^()]+\))
         """,
-        lambda m: f"SAFE_DIVIDE({m.group('num')}, {m.group('den')})",
-        sql_query,
-        flags=re.VERBOSE
+        r"SAFE_DIVIDE(\g<a>, \g<b>)",
+        sql,
+        flags=re.VERBOSE,
     )
 
-    # 6️⃣ Restore protected fragments LAST
-    for k, v in protected.items():
-        sql_query = sql_query.replace(k, v)
+    # 🔓 restore
+    for k, v in strings.items():
+        sql = sql.replace(k, v)
 
-    return sql_query
+    return sql
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -432,8 +414,8 @@ COST_TABLE    = `{COST_TABLE_REF}`
         flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
-    sql = _sanitize_division_by_zero(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
+    sql = _sanitize_division_by_zero(sql)
 
     return sql
 
