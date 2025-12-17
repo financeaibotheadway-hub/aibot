@@ -177,6 +177,53 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     return sql_query
 
+def _sanitize_division_by_zero(sql_query: str) -> str:
+    """
+    BigQuery-safe division sanitizer.
+
+    Rewrites:
+      a / b  -> SAFE_DIVIDE(a, b)
+
+    This prevents 'division by zero' runtime errors for MoM/YoY percent calculations.
+    """
+
+    # protect already-safe cases
+    if "SAFE_DIVIDE" in sql_query.upper():
+        # still continue; we only rewrite plain "/" patterns
+        pass
+
+    # Very common patterns from LLM:
+    #   (x - y) / y
+    #   x / y
+    # We'll rewrite simple binary divisions where denominator is a single token/expression.
+    # NOTE: This is heuristic, but works well for generated analytics SQL.
+    pattern = re.compile(
+        r"""
+        (?P<num>
+            \([^()]+\)                 # ( ... )  simple paren expr
+            |
+            [A-Za-z_][\w\.]*           # identifier
+            |
+            \d+(?:\.\d+)?              # number
+        )
+        \s*/\s*
+        (?P<den>
+            \([^()]+\)                 # ( ... )
+            |
+            [A-Za-z_][\w\.]*           # identifier
+            |
+            \d+(?:\.\d+)?              # number
+        )
+        """,
+        re.VERBOSE,
+    )
+
+    def _repl(m: re.Match) -> str:
+        num = m.group("num").strip()
+        den = m.group("den").strip()
+        return f"SAFE_DIVIDE({num}, {den})"
+
+    return pattern.sub(_repl, sql_query)
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -360,6 +407,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
 
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
+    sql = _sanitize_division_by_zero(sql)
 
     return sql
 
