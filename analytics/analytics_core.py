@@ -108,7 +108,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     Fixes:
     - CURRENT_DATE / CURRENT_DATE()
-    - 'YYYY-MM-01', 'YYYY-MM-DD' placeholders
+    - 'YYYY-MM-01', 'YYYY-MM-31', 'YYYY-MM-DD' placeholders
     - Removes PARSE_DATE around real DATE columns
     """
 
@@ -131,7 +131,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     )
 
     # ─────────────────────────────────────────────
-    # Remove PARSE_DATE around existing DATE columns
+    # Remove PARSE_DATE around real DATE columns
     # ─────────────────────────────────────────────
     for col in date_columns:
         pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
@@ -156,11 +156,21 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     )
 
     # ─────────────────────────────────────────────
-    # YYYY-MM-01 placeholder → first day of current month
+    # YYYY-MM-01 → first day of current month
     # ─────────────────────────────────────────────
     sql_query = re.sub(
         r"'YYYY-MM-01'",
         f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
+    # ─────────────────────────────────────────────
+    # ✅ YYYY-MM-31 → LAST_DAY of current month
+    # ─────────────────────────────────────────────
+    sql_query = re.sub(
+        r"'YYYY-MM-31'",
+        f"LAST_DAY(CURRENT_DATE('{LOCAL_TZ}'))",
         sql_query,
         flags=re.IGNORECASE,
     )
@@ -172,33 +182,36 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_window_order_by(sql: str) -> str:
     """
-    BigQuery rules:
-    - LAG / LEAD REQUIRE ORDER BY inside OVER(...)
-    - Other window functions MUST NOT have ORDER BY
+    BigQuery:
+    - LAG/LEAD REQUIRE ORDER BY inside OVER(...)
+    We fix only this error (do NOT strip ORDER BY from other window functions).
     """
 
-    def _fix(match):
-        over_clause = match.group(0)
-
-        has_lag_lead = re.search(r"\b(LAG|LEAD)\s*\(", over_clause, re.IGNORECASE)
-        has_order_by = re.search(r"\bORDER\s+BY\b", over_clause, re.IGNORECASE)
-
-        # ✅ LAG / LEAD without ORDER BY → add safe ORDER BY 1
-        if has_lag_lead and not has_order_by:
-            return over_clause[:-1] + " ORDER BY 1)"
-
-        # ❌ Non LAG/LEAD → remove ORDER BY
-        if not has_lag_lead and has_order_by:
-            return re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
-
-        return over_clause
-
-    return re.sub(
-        r"OVER\s*\([^\)]*\)",
-        _fix,
-        sql,
-        flags=re.IGNORECASE | re.DOTALL
+    pattern = re.compile(
+        r"""
+        (?P<fn>\b(?:LAG|LEAD)\s*\(.*?\))      # LAG(...) or LEAD(...)
+        \s*OVER\s*\(                         # OVER(
+        (?P<inside>[^)]*)                    # inside window spec (simple)
+        \)                                   # )
+        """,
+        re.IGNORECASE | re.DOTALL | re.VERBOSE,
     )
+
+    def _add_order_by(m: re.Match) -> str:
+        fn = m.group("fn")
+        inside = m.group("inside")
+
+        # already has ORDER BY -> keep
+        if re.search(r"\bORDER\s+BY\b", inside, re.IGNORECASE):
+            return m.group(0)
+
+        # add safest ORDER BY (syntactic) to satisfy BigQuery
+        # ORDER BY 1 is enough to pass validation when we can't infer date column
+        inside_fixed = (inside.strip() + " ORDER BY 1").strip()
+
+        return f"{fn} OVER ({inside_fixed})"
+
+    return pattern.sub(_add_order_by, sql)
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
