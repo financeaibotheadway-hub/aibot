@@ -105,12 +105,16 @@ def _collect_date_columns(schema_list):
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     """
     BigQuery-safe date sanitizer.
-
-    Fixes:
-    - CURRENT_DATE / CURRENT_DATE()
-    - 'YYYY-MM-01', 'YYYY-MM-31', 'YYYY-MM-DD' placeholders
-    - Removes PARSE_DATE around real DATE columns
     """
+
+    # 🚑 FIX: CURRENT_DATE(Europe/Kyiv) → CURRENT_DATE('Europe/Kyiv')
+    # MUST run before any other CURRENT_DATE handling
+    sql_query = re.sub(
+        r"CURRENT_DATE\s*\(\s*([A-Za-z]+\/[A-Za-z_]+)\s*\)",
+        r"CURRENT_DATE('\1')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
 
     # ─────────────────────────────────────────────
     # CURRENT_DATE()
@@ -155,9 +159,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # ─────────────────────────────────────────────
-    # YYYY-MM-01 → first day of current month
-    # ─────────────────────────────────────────────
+    # YYYY-MM-01 → first day of month
     sql_query = re.sub(
         r"'YYYY-MM-01'",
         f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)",
@@ -165,9 +167,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # ─────────────────────────────────────────────
-    # ✅ YYYY-MM-31 → LAST_DAY of current month
-    # ─────────────────────────────────────────────
+    # YYYY-MM-31 → LAST_DAY
     sql_query = re.sub(
         r"'YYYY-MM-31'",
         f"LAST_DAY(CURRENT_DATE('{LOCAL_TZ}'))",
@@ -178,18 +178,6 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     return sql_query
 
 def _sanitize_division_by_zero(sql_query: str) -> str:
-    """
-    BigQuery-safe division sanitizer.
-
-    Rewrites:
-      a / b  -> SAFE_DIVIDE(a, b)
-
-    Guarantees:
-    - does NOT touch string literals
-    - does NOT touch timezone identifiers (Europe/Kyiv)
-    - does NOT touch DATE / TIMESTAMP / CURRENT_DATE(...)
-    """
-
     protected = {}
 
     def _protect(m):
@@ -197,31 +185,39 @@ def _sanitize_division_by_zero(sql_query: str) -> str:
         protected[key] = m.group(0)
         return key
 
-    # 1️⃣ Protect string literals FIRST  → 'Europe/Kyiv'
+    # 1️⃣ Protect STRING literals FIRST  ← 🔴 КРИТИЧНО
     sql_query = re.sub(
         r"'[^']*'",
         _protect,
         sql_query
     )
 
-    # 2️⃣ Protect timezone identifiers WITHOUT quotes (defensive)
-    # Europe/Kyiv, America/New_York, etc
+    # 2️⃣ Protect AT TIME ZONE clauses (AT TIME ZONE Europe/Kyiv)
     sql_query = re.sub(
-        r"\b[A-Za-z]+\/[A-Za-z_]+\b",
+        r"\bAT\s+TIME\s+ZONE\s+[A-Za-z]+\/[A-Za-z_]+\b",
+        _protect,
+        sql_query,
+        flags=re.IGNORECASE
+    )
+
+    # 3️⃣ Protect timezone identifiers (Europe/Kyiv, America/New_York)
+    sql_query = re.sub(
+        # 3️⃣ Protect timezone identifiers (with or without spaces)
+    r"\b[A-Za-z_]+\s*/\s*[A-Za-z_]+\b",
         _protect,
         sql_query
     )
 
-    # 3️⃣ Protect date/time functions COMPLETELY
+    # 4️⃣ Protect ALL date/time functions
     sql_query = re.sub(
         r"\b(CURRENT_DATE|DATE|TIMESTAMP|DATETIME)\s*\([^)]*\)",
         _protect,
         sql_query,
-        flags=re.IGNORECASE,
+        flags=re.IGNORECASE
     )
 
-    # 4️⃣ Replace ONLY real numeric / column divisions
-    pattern = re.compile(
+    # 5️⃣ Replace divisions ONLY after full protection
+    sql_query = re.sub(
         r"""
         (?P<num>
             \([^()]+\)
@@ -239,15 +235,12 @@ def _sanitize_division_by_zero(sql_query: str) -> str:
             \d+(?:\.\d+)?
         )
         """,
-        re.VERBOSE,
-    )
-
-    sql_query = pattern.sub(
         lambda m: f"SAFE_DIVIDE({m.group('num')}, {m.group('den')})",
         sql_query,
+        flags=re.VERBOSE
     )
 
-    # 5️⃣ Restore protected fragments
+    # 6️⃣ Restore protected fragments LAST
     for k, v in protected.items():
         sql_query = sql_query.replace(k, v)
 
@@ -432,11 +425,15 @@ COST_TABLE    = `{COST_TABLE_REF}`
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     sql = sql.replace("```sql", "").replace("```", "").strip()
-    sql = re.sub(r"^\s*(bigquery|BigQuery|BigQuery SQL)\s*[:\-]*", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
+        "",
+        sql,
+        flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
-    sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+    sql = _sanitize_sql_dates(sql, date_cols)
 
     return sql
 
