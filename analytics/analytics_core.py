@@ -90,20 +90,6 @@ def get_all_schemas():
 # >>> preload
 _ = get_all_schemas()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LLM SQL SANITIZER
-# ──────────────────────────────────────────────────────────────────────────────
-def sanitize_llm_sql(sql: str) -> str:
-    sql = sql.strip()
-
-    # remove markdown fences
-    sql = re.sub(r"```(sql|bigquery)?", "", sql, flags=re.IGNORECASE)
-    sql = sql.replace("```", "")
-
-    # remove accidental 'bigquery' token at start
-    sql = re.sub(r"(?i)^\s*bigquery\s*", "", sql)
-
-    return sql.strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DATE TOOLS
@@ -117,15 +103,8 @@ def _collect_date_columns(schema_list):
 
 
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
-    """
-    Normalize dates for BigQuery:
-    - CURRENT_DATE / CURRENT_DATE() → CURRENT_DATE('TZ')
-    - Remove PARSE_DATE around real DATE columns
-    - Fix placeholder dates like 'YYYY-MM-01'
-    - Wrap naked 'YYYY-MM-DD' literals into DATE(...)
-    """
+    sql_original = sql_query
 
-    # CURRENT_DATE()
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -133,7 +112,6 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # CURRENT_DATE without ()
     sql_query = re.sub(
         r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -141,163 +119,46 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Remove PARSE_DATE around DATE columns
+    # Remove PARSE_DATE around existing DATE fields
     for col in date_columns:
-        pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
+        p1 = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
 
-        def _unwrap_parse_date(m):
+        def repl1(m):
             inner = m.group(1)
             clean = inner.strip("`")
-            if clean == col or clean.endswith(f".{col}"):
+            if clean.endswith(f".{col}") or clean == col:
                 return inner
             return m.group(0)
 
-        sql_query = re.sub(pattern, _unwrap_parse_date, sql_query, flags=re.IGNORECASE)
-
-    # ✅ FIX placeholder 'YYYY-MM-DD' (no LPAD!)
-    def _ph_date_repl(m):
-        day = int(m.group(1))
-        # first day of current month + (day-1)
-        if day <= 1:
-            return f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)"
-        return f"DATE_ADD(DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH), INTERVAL {day-1} DAY)"
-
-    # catches 'YYYY-MM-01', 'YYYY-MM-15', etc
-    sql_query = re.sub(r"(?i)\b'YYYY-MM-(\d{2})'\b", _ph_date_repl, sql_query)
-
-    # Wrap real '2024-03-01' → DATE('2024-03-01')
-    sql_query = re.sub(
-        r"(?<!DATE\()\b'(\d{4}-\d{2}-\d{2})'\b",
-        r"DATE('\1')",
-        sql_query,
-    )
+        sql_query = re.sub(p1, repl1, sql_query, flags=re.IGNORECASE)
 
     return sql_query
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GROWTH QUERY DETECTOR (UNIVERSAL)
-# ──────────────────────────────────────────────────────────────────────────────
-def is_month_over_month_growth_query(text: str) -> bool:
-    t = text.lower()
 
-    growth_tokens = [
-        "зрос", "зрост", "increase", "grew", "growth", "rise", "delta"
-    ]
-
-    time_tokens = [
-        "місяц", "month", "monthly"
-    ]
-
-    return any(g in t for g in growth_tokens) and any(m in t for m in time_tokens)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# UNIVERSAL MONTH GROWTH SQL BUILDER
-# ──────────────────────────────────────────────────────────────────────────────
-def build_month_growth_sql(
-    table_ref: str,
-    date_col: str,
-    value_expr: str,
-    where_clause: str | None = None,
-    return_first_only: bool = True
-) -> str:
-
-    where_sql = f"\nWHERE {where_clause}" if where_clause else ""
-
-    limit_sql = "LIMIT 1" if return_first_only else ""
-
-    return f"""
-WITH monthly AS (
-  SELECT
-    DATE_TRUNC({date_col}, MONTH) AS month,
-    {value_expr} AS value
-  FROM `{table_ref}`
-  {where_sql}
-  GROUP BY 1
-),
-diffs AS (
-  SELECT
-    month,
-    value,
-    LAG(value) OVER (ORDER BY month) AS prev_value
-  FROM monthly
-),
-growth AS (
-  SELECT
-    month,
-    value,
-    prev_value,
-    value - prev_value AS diff,
-    SAFE_DIVIDE(value - prev_value, prev_value) * 100 AS growth_pct
-  FROM diffs
-  WHERE prev_value IS NOT NULL
-)
-SELECT
-  month,
-  value,
-  prev_value,
-  diff,
-  growth_pct
-FROM growth
-WHERE diff > 0
-ORDER BY month
-{limit_sql}
-""".strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_window_order_by(sql: str) -> str:
     """
-    Only fix LAG/LEAD: ensure OVER(...) contains ORDER BY.
-    Do NOT remove ORDER BY from other window functions (BigQuery allows it).
+    Обробка window-функцій:
+    - Якщо всередині OVER(...) використовується LAG/LEAD → нічого не змінюємо
+    - Якщо є ORDER BY всередині OVER(...) → видаляємо його
+    Звичайний ORDER BY у кінці запиту не чіпаємо.
     """
-    s = sql
-    pattern = re.compile(r"\b(LAG|LEAD)\s*\(", re.IGNORECASE)
 
-    i = 0
-    while True:
-        m = pattern.search(s, i)
-        if not m:
-            break
+    def _fix(match):
+        over_clause = match.group(0)
 
-        # find "OVER" after this LAG/LEAD call
-        over_m = re.search(r"\bOVER\s*\(", s[m.end():], re.IGNORECASE)
-        if not over_m:
-            i = m.end()
-            continue
+        # Якщо у вікні використовується LAG/LEAD — залишаємо все як є
+        if re.search(r"\bLAG\s*\(|\bLEAD\s*\(", over_clause, flags=re.IGNORECASE):
+            return over_clause
 
-        over_pos = m.end() + over_m.start()  # points to 'OVER'
-        paren_pos = s.find("(", over_pos)
-        if paren_pos == -1:
-            i = m.end()
-            continue
+        # Прибираємо ORDER BY усередині OVER(...)
+        cleaned = re.sub(r"ORDER\s+BY\s+[^\)]*", "", over_clause, flags=re.IGNORECASE)
+        return cleaned
 
-        # extract balanced (...) after OVER(
-        depth = 0
-        j = paren_pos
-        while j < len(s):
-            if s[j] == "(":
-                depth += 1
-            elif s[j] == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-
-        if depth != 0:
-            i = m.end()
-            continue
-
-        over_inner = s[paren_pos + 1 : j]
-        if not re.search(r"\bORDER\s+BY\b", over_inner, re.IGNORECASE):
-            # add ORDER BY 1 at the end of OVER(...)
-            new_inner = over_inner.rstrip() + " ORDER BY 1"
-            s = s[:paren_pos + 1] + new_inner + s[j:]
-            i = paren_pos + 1 + len(new_inner) + 1
-        else:
-            i = j + 1
-
-    return s
+    # Застосувати до всіх OVER(...)
+    return re.sub(r"OVER\s*\([^\)]*\)", _fix, sql, flags=re.IGNORECASE | re.DOTALL)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -318,33 +179,7 @@ def execute_cached_query(sql_query: str):
     query_cache[cache_key] = (df.copy(), now)
     return df
 
-def normalize_metric(metric, instruction_part: str) -> dict | None:
-    """
-    detect_metric может вернуть dict или str.
-    Приводим к dict, чтобы безопасно делать .get().
-    """
-    if metric is None:
-        return None
 
-    if isinstance(metric, dict):
-        return metric
-
-    # если пришла строка — считаем это названием метрики
-    if isinstance(metric, str):
-        t = instruction_part.lower()
-
-        # простая эвристика таблицы
-        if any(x in t for x in ["cost", "витрат", "спенд", "opex", "оренд", "rent", "expense"]):
-            table = "cost"
-        elif any(x in t for x in ["revenue", "дохід", "sales", "gmv"]):
-            table = "revenue"
-        else:
-            table = None
-
-        return {"name": metric, "table": table, "where": None}
-
-    # на всякий случай
-    return None
 # ──────────────────────────────────────────────────────────────────────────────
 # AI FIELD MATCHING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -412,55 +247,13 @@ def split_into_separate_queries(message: str) -> list:
 # SQL GENERATOR + METRIC PARSER INTEGRATION
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_sql(instruction_part: str, smap) -> str:
-    # ──────────────────────────────────────────────────────────
-    # HARD LOGIC: Month-over-Month Growth (NO LLM)
-    # ──────────────────────────────────────────────────────────
-    if is_month_over_month_growth_query(instruction_part):
+    """
+    Тут ми вставляємо metric_parser.detect_metric + metric_loader.get_metrics
+    і даємо SQL-генерації підказку з метрикою.
+    """
 
-        raw_metric = detect_metric(instruction_part)
-        metric = normalize_metric(raw_metric, instruction_part)
-
-        # 🔒 SAFETY FIX: metric must be dict
-        if metric is not None and not isinstance(metric, dict):
-            logger.error(f"Metric is not dict: {metric} ({type(metric)})")
-            metric = None
-
-        # COST / OPEX
-        if metric and metric.get("table") == "cost":
-            return build_month_growth_sql(
-                table_ref=COST_TABLE_REF,
-                date_col="date",
-                value_expr="SUM(cost)",
-                where_clause=metric.get("where")
-            )
-
-        # REVENUE / SALES
-        if metric and metric.get("table") == "revenue":
-            return build_month_growth_sql(
-                table_ref=REVENUE_TABLE_REF,
-                date_col="date",
-                value_expr="SUM(revenue)",
-                where_clause=metric.get("where")
-            )
-
-        # fallback — універсальний
-        return build_month_growth_sql(
-            table_ref=COST_TABLE_REF,
-            date_col="date",
-            value_expr="SUM(cost)"
-        )
-
-    # ──────────────────────────────────────────────────────────
-    # LLM PATH (fallback)
-    # ──────────────────────────────────────────────────────────
-    raw_metric = detect_metric(instruction_part)
-    metric = normalize_metric(raw_metric, instruction_part)
-
-    # 🔒 SAFETY FIX: metric must be dict
-    if metric is not None and not isinstance(metric, dict):
-        logger.error(f"Metric is not dict: {metric} ({type(metric)})")
-        metric = None
-
+    # 1. Детекція метрики
+    metric = detect_metric(instruction_part)
     metrics = get_metrics()
 
     metric_hint = f"\nВизначена метрика: {metric}\n" if metric else ""
@@ -468,8 +261,8 @@ def generate_sql(instruction_part: str, smap) -> str:
     rev_schema, cost_schema = get_all_schemas()
     date_cols = _collect_date_columns(rev_schema) | _collect_date_columns(cost_schema)
 
-    rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else ""
-    cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else ""
+    rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
+    cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
 
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання:
@@ -478,34 +271,48 @@ def generate_sql(instruction_part: str, smap) -> str:
 
 {metric_hint}
 
+Повні назви таблиць:
 REVENUE_TABLE = `{REVENUE_TABLE_REF}`
 COST_TABLE    = `{COST_TABLE_REF}`
 
-Метрики:
+Доступні поля (метрики):
 {metrics}
 
-REVENUE columns:
+Стовпці таблиці REVENUE (реальні назви колонок):
 {rev_cols}
 
-COST columns:
+Стовпці таблиці COST (реальні назви колонок):
 {cost_cols}
 
+Схема REVENUE:
+{json.dumps(rev_schema, indent=2)}
+
+Схема COST:
+{json.dumps(cost_schema, indent=2)}
+
 Правила:
-- Використовуй тільки BigQuery SQL
-- Не вигадуй колонок
-- Для агрегатів став alias
-- CURRENT_DATE('{LOCAL_TZ}')
-- ORDER BY у window — тільки для LAG/LEAD
-- Поверни ТІЛЬКИ SQL
+- Використовуй ТІЛЬКИ ті поля, які є в списках колонок вище. Не вигадуй нових полів (наприклад, event_type), якщо їх немає в схемі.
+- Якщо запит про "opex", "cost", "витрати", "спенд" — використовуй таблицю `{COST_TABLE_REF}`.
+- Якщо запит про revenue, дохід, GMV — використовуй таблицю `{REVENUE_TABLE_REF}`.
+- Для агрегатів (SUM, AVG, COUNT, тощо) завжди став alias, наприклад: SELECT SUM(revenue) AS value.
+- Не залишай SELECT SUM(...) без alias, щоб назва колонки не була f0_.
+- Використовуй тільки BigQuery SQL.
+- Не використовуй STRFTIME.
+- Використовуй CURRENT_DATE('{LOCAL_TZ}').
+- Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
+- Поверни лише SQL без пояснень і без Markdown.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
+    sql = resp.text.strip()
+    sql = sql.replace("```sql", "").replace("```", "").strip()
 
-    sql = sanitize_llm_sql(resp.text)
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
 
     return sql
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
 # ──────────────────────────────────────────────────────────────────────────────
@@ -630,3 +437,4 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
+
