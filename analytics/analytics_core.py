@@ -318,7 +318,33 @@ def execute_cached_query(sql_query: str):
     query_cache[cache_key] = (df.copy(), now)
     return df
 
+def normalize_metric(metric, instruction_part: str) -> dict | None:
+    """
+    detect_metric может вернуть dict или str.
+    Приводим к dict, чтобы безопасно делать .get().
+    """
+    if metric is None:
+        return None
 
+    if isinstance(metric, dict):
+        return metric
+
+    # если пришла строка — считаем это названием метрики
+    if isinstance(metric, str):
+        t = instruction_part.lower()
+
+        # простая эвристика таблицы
+        if any(x in t for x in ["cost", "витрат", "спенд", "opex", "оренд", "rent", "expense"]):
+            table = "cost"
+        elif any(x in t for x in ["revenue", "дохід", "sales", "gmv"]):
+            table = "revenue"
+        else:
+            table = None
+
+        return {"name": metric, "table": table, "where": None}
+
+    # на всякий случай
+    return None
 # ──────────────────────────────────────────────────────────────────────────────
 # AI FIELD MATCHING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -391,7 +417,13 @@ def generate_sql(instruction_part: str, smap) -> str:
     # ──────────────────────────────────────────────────────────
     if is_month_over_month_growth_query(instruction_part):
 
-        metric = detect_metric(instruction_part)
+        raw_metric = detect_metric(instruction_part)
+        metric = normalize_metric(raw_metric, instruction_part)
+
+        # 🔒 SAFETY FIX: metric must be dict
+        if metric is not None and not isinstance(metric, dict):
+            logger.error(f"Metric is not dict: {metric} ({type(metric)})")
+            metric = None
 
         # COST / OPEX
         if metric and metric.get("table") == "cost":
@@ -411,15 +443,24 @@ def generate_sql(instruction_part: str, smap) -> str:
                 where_clause=metric.get("where")
             )
 
-        # fallback — safe default
+        # fallback — універсальний
         return build_month_growth_sql(
             table_ref=COST_TABLE_REF,
             date_col="date",
             value_expr="SUM(cost)"
         )
 
-    # 1. Детекція метрики
-    metric = detect_metric(instruction_part)
+    # ──────────────────────────────────────────────────────────
+    # LLM PATH (fallback)
+    # ──────────────────────────────────────────────────────────
+    raw_metric = detect_metric(instruction_part)
+    metric = normalize_metric(raw_metric, instruction_part)
+
+    # 🔒 SAFETY FIX: metric must be dict
+    if metric is not None and not isinstance(metric, dict):
+        logger.error(f"Metric is not dict: {metric} ({type(metric)})")
+        metric = None
+
     metrics = get_metrics()
 
     metric_hint = f"\nВизначена метрика: {metric}\n" if metric else ""
@@ -427,8 +468,8 @@ def generate_sql(instruction_part: str, smap) -> str:
     rev_schema, cost_schema = get_all_schemas()
     date_cols = _collect_date_columns(rev_schema) | _collect_date_columns(cost_schema)
 
-    rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
-    cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
+    rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else ""
+    cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else ""
 
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання:
@@ -437,52 +478,34 @@ def generate_sql(instruction_part: str, smap) -> str:
 
 {metric_hint}
 
-Повні назви таблиць:
 REVENUE_TABLE = `{REVENUE_TABLE_REF}`
 COST_TABLE    = `{COST_TABLE_REF}`
 
-Доступні поля (метрики):
+Метрики:
 {metrics}
 
-Стовпці таблиці REVENUE (реальні назви колонок):
+REVENUE columns:
 {rev_cols}
 
-Стовпці таблиці COST (реальні назви колонок):
+COST columns:
 {cost_cols}
 
-Схема REVENUE:
-{json.dumps(rev_schema, indent=2)}
-
-Схема COST:
-{json.dumps(cost_schema, indent=2)}
-
 Правила:
-- Використовуй ТІЛЬКИ ті поля, які є в списках колонок вище. Не вигадуй нових полів (наприклад, event_type), якщо їх немає в схемі.
-- Якщо запит про "opex", "cost", "витрати", "спенд" — використовуй таблицю `{COST_TABLE_REF}`.
-- Якщо запит про revenue, дохід, GMV — використовуй таблицю `{REVENUE_TABLE_REF}`.
-- Для агрегатів (SUM, AVG, COUNT, тощо) завжди став alias, наприклад: SELECT SUM(revenue) AS value.
-- Не залишай SELECT SUM(...) без alias, щоб назва колонки не була f0_.
-- Використовуй тільки BigQuery SQL.
-- Не використовуй STRFTIME.
-- Використовуй CURRENT_DATE('{LOCAL_TZ}').
-- Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
-- Поверни лише SQL без пояснень і без Markdown.
+- Використовуй тільки BigQuery SQL
+- Не вигадуй колонок
+- Для агрегатів став alias
+- CURRENT_DATE('{LOCAL_TZ}')
+- ORDER BY у window — тільки для LAG/LEAD
+- Поверни ТІЛЬКИ SQL
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
 
-    # ✨ Sanitize raw LLM output first
     sql = sanitize_llm_sql(resp.text)
-
-    # ✨ Fix window functions (LAG/LEAD order issues)
     sql = fix_window_order_by(sql)
-
-    # ✨ Fix dates and casts
     sql = _sanitize_sql_dates(sql, date_cols)
 
     return sql
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
 # ──────────────────────────────────────────────────────────────────────────────
