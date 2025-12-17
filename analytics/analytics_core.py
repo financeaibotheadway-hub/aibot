@@ -180,19 +180,20 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 def _sanitize_division_by_zero(sql: str) -> str:
     """
     SAFE: replaces a / b -> SAFE_DIVIDE(a, b)
-    GUARANTEE: no placeholders ever leak to final SQL
+    GUARANTEE: no placeholders ever break SQL
     """
 
     strings = {}
 
     def protect(m):
-        k = f"__STR_{len(strings)}__"
+        k = f"/*__STR_{len(strings)}__*/"
         strings[k] = m.group(0)
         return k
 
-    # 🔒 ALWAYS protect first
+    # 🔒 protect strings
     sql = re.sub(r"'[^']*'", protect, sql)
 
+    # 🔒 protect date/time functions
     sql = re.sub(
         r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
         protect,
@@ -200,13 +201,14 @@ def _sanitize_division_by_zero(sql: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 🔒 protect timezone identifiers
     sql = re.sub(
         r"\b[A-Za-z_]+/[A-Za-z_]+\b",
         protect,
         sql,
     )
 
-    # ✅ replace divisions
+    # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
         r"""
         (?P<a>\([^()]+\)|\b[\w\.]+\b)
@@ -218,7 +220,7 @@ def _sanitize_division_by_zero(sql: str) -> str:
         flags=re.VERBOSE,
     )
 
-    # 🔓 ALWAYS restore
+    # 🔓 restore (best-effort)
     for k, v in strings.items():
         sql = sql.replace(k, v)
 
