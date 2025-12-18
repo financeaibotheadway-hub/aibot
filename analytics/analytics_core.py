@@ -179,17 +179,57 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
 def strip_unknown_fields(sql: str, allowed_columns: set) -> str:
     """
-    Видаляє WHERE / AND умови з неіснуючими полями (наприклад event_type)
-    FAST HOTFIX.
+    HARD HOTFIX:
+    - видаляє невідомі колонки з SELECT, WHERE, GROUP BY, ORDER BY
+    - рятує від Unrecognized name
     """
-    for col in re.findall(r"\b([a-zA-Z_][\w]*)\b", sql):
-        if col not in allowed_columns:
-            sql = re.sub(
-                rf"\s+(AND|WHERE)\s+{col}\s*=\s*'[^']*'",
-                "",
-                sql,
-                flags=re.IGNORECASE,
-            )
+
+    tokens = re.findall(r"\b([a-zA-Z_][\w]*)\b", sql)
+
+    unknown = {
+        t for t in tokens
+        if t not in allowed_columns
+        and t.upper() not in {
+            "SELECT", "FROM", "WHERE", "AND", "OR", "AS",
+            "GROUP", "BY", "ORDER", "LIMIT",
+            "SUM", "COUNT", "AVG", "MIN", "MAX",
+            "ON", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
+            "SAFE_DIVIDE", "DATE", "CURRENT_DATE"
+        }
+    }
+
+    for col in unknown:
+        # прибрати з SELECT
+        sql = re.sub(rf"\b{col}\b\s*,?", "", sql, flags=re.IGNORECASE)
+
+        # прибрати WHERE / AND
+        sql = re.sub(
+            rf"\s+(AND|WHERE)\s+{col}\s*[=<>!]+\s*[^)\s]+",
+            "",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+        # прибрати GROUP BY
+        sql = re.sub(
+            rf"(GROUP\s+BY[^;]*)\b{col}\b\s*,?",
+            r"\1",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+        # прибрати ORDER BY
+        sql = re.sub(
+            rf"(ORDER\s+BY[^;]*)\b{col}\b\s*,?",
+            r"\1",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    # косметика
+    sql = re.sub(r",\s*,", ",", sql)
+    sql = re.sub(r",\s*(FROM|WHERE|GROUP|ORDER)", r" \1", sql)
+
     return sql
 
 def _sanitize_division_by_zero(sql: str) -> str:
@@ -446,7 +486,11 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         return "Повідомлення порожнє."
 
     matched = find_matches_with_ai(instruction_part, smap)
+    rev_schema, cost_schema = get_all_schemas()
+    allowed_cols = {c["name"] for c in rev_schema} | {c["name"] for c in cost_schema}
+
     for field, value in matched:
+    if field in allowed_cols:
         instruction_part += f" ({field}='{value}')"
 
     sql_query = generate_sql(instruction_part, smap)
