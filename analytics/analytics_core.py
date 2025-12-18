@@ -106,16 +106,6 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     """
     BigQuery-safe date sanitizer.
     """
-
-    # 🚑 FIX: CURRENT_DATE(Europe/Kyiv) → CURRENT_DATE('Europe/Kyiv')
-    # MUST run before any other CURRENT_DATE handling
-    sql_query = re.sub(
-        r"CURRENT_DATE\s*\(\s*([A-Za-z]+\/[A-Za-z_]+)\s*\)",
-        r"CURRENT_DATE('\1')",
-        sql_query,
-        flags=re.IGNORECASE,
-    )
-
     # ─────────────────────────────────────────────
     # CURRENT_DATE()
     # ─────────────────────────────────────────────
@@ -171,6 +161,13 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     sql_query = re.sub(
         r"'YYYY-MM-31'",
         f"LAST_DAY(CURRENT_DATE('{LOCAL_TZ}'))",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
+    sql_query = re.sub(
+        r"CURRENT_DATE\s*\(\s*CURRENT_DATE\s*\(([^)]*)\)\s*\)",
+        r"CURRENT_DATE(\1)",
         sql_query,
         flags=re.IGNORECASE,
     )
@@ -401,6 +398,8 @@ COST_TABLE    = `{COST_TABLE_REF}`
 - Використовуй CURRENT_DATE('{LOCAL_TZ}').
 - Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
 - Поверни лише SQL без пояснень і без Markdown.
+- Якщо потрібно ділення — ВИКОРИСТОВУЙ ТІЛЬКИ SAFE_DIVIDE(a, b)
+- НІКОЛИ не використовуй оператор /
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
