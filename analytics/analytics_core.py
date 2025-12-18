@@ -106,6 +106,16 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     """
     BigQuery-safe date sanitizer.
     """
+
+    # 🚑 FIX: CURRENT_DATE(Europe/Kyiv) → CURRENT_DATE('Europe/Kyiv')
+    # MUST run before any other CURRENT_DATE handling
+    sql_query = re.sub(
+        r"CURRENT_DATE\s*\(\s*([A-Za-z]+\/[A-Za-z_]+)\s*\)",
+        r"CURRENT_DATE('\1')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+
     # ─────────────────────────────────────────────
     # CURRENT_DATE()
     # ─────────────────────────────────────────────
@@ -165,13 +175,6 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
         flags=re.IGNORECASE,
     )
 
-    sql_query = re.sub(
-        r"CURRENT_DATE\s*\(\s*CURRENT_DATE\s*\(([^)]*)\)\s*\)",
-        r"CURRENT_DATE(\1)",
-        sql_query,
-        flags=re.IGNORECASE,
-    )
-
     return sql_query
 
 def _sanitize_division_by_zero(sql: str) -> str:
@@ -205,17 +208,16 @@ def _sanitize_division_by_zero(sql: str) -> str:
         sql,
     )
 
-    # ✅ SAFE_DIVIDE only for math (but NOT inside SAFE_DIVIDE)
+    # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
         r"""
-        (?<!SAFE_DIVIDE\()          # ⛔ not already inside SAFE_DIVIDE(
         (?P<a>\([^()]+\)|\b[\w\.]+\b)
         \s*/\s*
         (?P<b>\([^()]+\)|\b[\w\.]+\b)
         """,
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
-        flags=re.VERBOSE | re.IGNORECASE,
+        flags=re.VERBOSE,
     )
 
     # 🔓 restore (best-effort)
@@ -399,7 +401,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
 - Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
 - Поверни лише SQL без пояснень і без Markdown.
 - Якщо потрібно ділення — ВИКОРИСТОВУЙ ТІЛЬКИ SAFE_DIVIDE(a, b)
-- НІКОЛИ не використовуй оператор /
+
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -417,24 +419,6 @@ COST_TABLE    = `{COST_TABLE_REF}`
 
     return sql
 
-
-def _format_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # округлення float
-    for col in df.columns:
-        if pd.api.types.is_float_dtype(df[col]):
-            df[col] = df[col].round(2)
-
-    # NaN / None
-    df = df.fillna("—")
-
-    # нормалізація None як категорії
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].replace("None", "UNASSIGNED")
-
-    return df
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
@@ -464,7 +448,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
-        df = _format_df_for_display(df)
 
     # ======================================================================
     # TABLE RENDER (MARKDOWN)
@@ -484,6 +467,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         return "\n".join([header, separator] + rows)
 
+    # ======================================================================
+    # ASCII CHART
+    # ======================================================================
     def render_ascii_chart(df: pd.DataFrame) -> str:
         import numpy as np
 
@@ -529,6 +515,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             lines.append(f"{label[:20]:20} | {sign}{bar} {val:.2f}")
 
         return "\n".join(lines)
+
     # ======================================================================
     # Compose final Slack message
     # ======================================================================
