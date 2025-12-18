@@ -486,12 +486,15 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         return "Повідомлення порожнє."
 
     matched = find_matches_with_ai(instruction_part, smap)
-    rev_schema, cost_schema = get_all_schemas()
-    allowed_cols = {c["name"] for c in rev_schema} | {c["name"] for c in cost_schema}
 
+    # беремо схеми і дозволені колонки
+    rev_schema, cost_schema = get_all_schemas()
+    allowed_cols = {c["name"].lower() for c in rev_schema} | {c["name"].lower() for c in cost_schema}
+
+    # додаємо тільки ті фільтри, де поле реально існує
     for field, value in matched:
-    if field in allowed_cols:
-        instruction_part += f" ({field}='{value}')"
+        if field and field.lower() in allowed_cols:
+            instruction_part += f" ({field}='{value}')"
 
     sql_query = generate_sql(instruction_part, smap)
 
@@ -506,58 +509,33 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if df.empty:
         return "Результат порожній."
 
-    # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
 
-    # ======================================================================
-    # TABLE RENDER (MARKDOWN)
-    # ======================================================================
     def render_table(df: pd.DataFrame) -> str:
-        col_widths = {
-            col: max(df[col].astype(str).map(len).max(), len(col))
-            for col in df.columns
-        }
-
+        col_widths = {col: max(df[col].astype(str).map(len).max(), len(col)) for col in df.columns}
         header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
         separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
-
         rows = []
         for _, row in df.iterrows():
             rows.append("| " + " | ".join(f"{str(row[col]):{col_widths[col]}}" for col in df.columns) + " |")
-
         return "\n".join([header, separator] + rows)
 
-    # ======================================================================
-    # ASCII CHART
-    # ======================================================================
     def render_ascii_chart(df: pd.DataFrame) -> str:
         import numpy as np
-
-        # ❗ FIX 2.3: не показувати графік, якщо 1 рядок або менше
         if df.shape[0] <= 1:
             return ""
-
-        # numeric value column
         num_cols = df.select_dtypes(include=["float", "int"]).columns
         if len(num_cols) == 0:
             return ""
-
         val_col = num_cols[0]
-
-        # label column (date / month / fallback)
-        label_cols = [
-            c for c in df.columns
-            if "date" in c.lower() or "month" in c.lower()
-        ]
+        label_cols = [c for c in df.columns if "date" in c.lower() or "month" in c.lower()]
         if not label_cols:
             label_cols = [df.columns[0]]
-
         label_col = label_cols[0]
 
         values = df[val_col].fillna(0).tolist()
         labels = df[label_col].astype(str).tolist()
-
         pairs = list(zip(labels, values))
         if not pairs:
             return ""
@@ -574,20 +552,12 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             bar = "█" * bar_len
             sign = "-" if val < 0 else ""
             lines.append(f"{label[:20]:20} | {sign}{bar} {val:.2f}")
-
         return "\n".join(lines)
 
-    # ======================================================================
-    # Compose final Slack message
-    # ======================================================================
     table_md = render_table(df)
     ascii_md = render_ascii_chart(df)
-
     final_display = f"```\n{table_md}\n```\n{ascii_md}"
 
-    # ======================================================================
-    # Vertex analysis — unchanged
-    # ======================================================================
     analysis_prompt = f"""
 Проаналізуй результат CSV нижче:
 
@@ -599,7 +569,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 Зроби короткий висновок (3–4 речення).
 """
     resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
-
     return final_display + "\n\n" + resp.text.strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY
