@@ -446,13 +446,28 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
-
     # ======================================================================
     # TABLE RENDER (MARKDOWN)
     # ======================================================================
-    def render_table(df: pd.DataFrame) -> str:
+    def render_table(df: pd.DataFrame, limit: int = 10) -> str:
+        df = df.copy()
+
+        num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+        if num_cols:
+            df = df.sort_values(by=num_cols[0], ascending=False)
+
+        df = df.head(limit)
+
+        for col in num_cols:
+            df[col] = df[col].round(2).map(
+                lambda x: f"{x:,.2f}".replace(",", " ")
+                if pd.notnull(x) else ""
+            )
+
+        df = df.astype(str)
+
         col_widths = {
-            col: max(df[col].astype(str).map(len).max(), len(col))
+            col: max(df[col].map(len).max(), len(col))
             for col in df.columns
         }
 
@@ -461,44 +476,48 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         rows = []
         for _, row in df.iterrows():
-            rows.append("| " + " | ".join(f"{str(row[col]):{col_widths[col]}}" for col in df.columns) + " |")
+            rows.append(
+                "| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |"
+            )
 
         return "\n".join([header, separator] + rows)
 
     # ======================================================================
     # ASCII CHART
     # ======================================================================
-    def render_ascii_chart(df: pd.DataFrame) -> str:
-        import numpy as np
+    def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
+        df = df.copy()
 
-        # numeric value column
-        num_cols = df.select_dtypes(include=["float", "int"]).columns
-        if len(num_cols) == 0:
+        num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+        if not num_cols:
             return ""
 
         val_col = num_cols[0]
 
-        # date-like label column
-        date_cols = [c for c in df.columns if "date" in c.lower() or "month" in c.lower()]
-        if len(date_cols) == 0:
-            date_cols = [df.columns[0]]
+        label_cols = [
+            c for c in df.columns
+            if c != val_col and df[c].dtype == object
+        ]
+        label_col = label_cols[0] if label_cols else df.columns[0]
 
-        x_col = date_cols[0]
+        df = df.sort_values(by=val_col, ascending=False).head(limit)
 
         values = df[val_col].fillna(0).tolist()
-        labels = df[x_col].astype(str).tolist()
+        labels = df[label_col].astype(str).tolist()
 
-        max_len = 40
+        max_len = 30
         max_val = max(values) if max(values) > 0 else 1
 
-        lines = ["📈 *ASCII графік*"]
+        lines = ["📊 *TOP-10 графік*"]
+
         for label, val in zip(labels, values):
             bar_len = int((val / max_val) * max_len)
             bar = "█" * bar_len
-            lines.append(f"{label:10} | {bar} {val}")
+            val_fmt = f"{val:,.2f}".replace(",", " ")
+            lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
 
         return "\n".join(lines)
-
+        
     # ======================================================================
     # Compose final Slack message
     # ======================================================================
