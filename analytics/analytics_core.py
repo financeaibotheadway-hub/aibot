@@ -177,6 +177,21 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     return sql_query
 
+def strip_unknown_fields(sql: str, allowed_columns: set) -> str:
+    """
+    Видаляє WHERE / AND умови з неіснуючими полями (наприклад event_type)
+    FAST HOTFIX.
+    """
+    for col in re.findall(r"\b([a-zA-Z_][\w]*)\b", sql):
+        if col not in allowed_columns:
+            sql = re.sub(
+                rf"\s+(AND|WHERE)\s+{col}\s*=\s*'[^']*'",
+                "",
+                sql,
+                flags=re.IGNORECASE,
+            )
+    return sql
+
 def _sanitize_division_by_zero(sql: str) -> str:
     """
     SAFE: replaces a / b -> SAFE_DIVIDE(a, b)
@@ -416,6 +431,8 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+    allowed_cols = {c["name"] for c in rev_schema} | {c["name"] for c in cost_schema}
+    sql = strip_unknown_fields(sql, allowed_cols)
 
     return sql
 
