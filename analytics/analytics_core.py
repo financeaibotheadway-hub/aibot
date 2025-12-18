@@ -208,16 +208,17 @@ def _sanitize_division_by_zero(sql: str) -> str:
         sql,
     )
 
-    # ✅ SAFE_DIVIDE only for math
+    # ✅ SAFE_DIVIDE only for math (but NOT inside SAFE_DIVIDE)
     sql = re.sub(
         r"""
+        (?<!SAFE_DIVIDE\()          # ⛔ not already inside SAFE_DIVIDE(
         (?P<a>\([^()]+\)|\b[\w\.]+\b)
         \s*/\s*
         (?P<b>\([^()]+\)|\b[\w\.]+\b)
         """,
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
-        flags=re.VERBOSE,
+        flags=re.VERBOSE | re.IGNORECASE,
     )
 
     # 🔓 restore (best-effort)
@@ -418,6 +419,24 @@ COST_TABLE    = `{COST_TABLE_REF}`
     return sql
 
 
+def _format_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # округлення float
+    for col in df.columns:
+        if pd.api.types.is_float_dtype(df[col]):
+            df[col] = df[col].round(2)
+
+    # NaN / None
+    df = df.fillna("—")
+
+    # нормалізація None як категорії
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].replace("None", "UNASSIGNED")
+
+    return df
+
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
 # ──────────────────────────────────────────────────────────────────────────────
@@ -446,6 +465,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
+        df = _format_df_for_display(df)
 
     # ======================================================================
     # TABLE RENDER (MARKDOWN)
@@ -465,11 +485,12 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         return "\n".join([header, separator] + rows)
 
-    # ======================================================================
-    # ASCII CHART
-    # ======================================================================
     def render_ascii_chart(df: pd.DataFrame) -> str:
         import numpy as np
+
+        # ❗ FIX 2.3: не показувати графік, якщо 1 рядок або менше
+        if df.shape[0] <= 1:
+            return ""
 
         # numeric value column
         num_cols = df.select_dtypes(include=["float", "int"]).columns
@@ -478,27 +499,37 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
         val_col = num_cols[0]
 
-        # date-like label column
-        date_cols = [c for c in df.columns if "date" in c.lower() or "month" in c.lower()]
-        if len(date_cols) == 0:
-            date_cols = [df.columns[0]]
+        # label column (date / month / fallback)
+        label_cols = [
+            c for c in df.columns
+            if "date" in c.lower() or "month" in c.lower()
+        ]
+        if not label_cols:
+            label_cols = [df.columns[0]]
 
-        x_col = date_cols[0]
+        label_col = label_cols[0]
 
         values = df[val_col].fillna(0).tolist()
-        labels = df[x_col].astype(str).tolist()
+        labels = df[label_col].astype(str).tolist()
 
-        max_len = 40
-        max_val = max(values) if max(values) > 0 else 1
+        pairs = list(zip(labels, values))
+        if not pairs:
+            return ""
 
-        lines = ["📈 *ASCII графік*"]
+        pairs = sorted(pairs, key=lambda x: abs(x[1]), reverse=True)[:10]
+        labels, values = zip(*pairs)
+
+        max_len = 30
+        max_val = max(abs(v) for v in values) or 1
+
+        lines = ["📈 *ASCII графік (TOP-10)*"]
         for label, val in zip(labels, values):
-            bar_len = int((val / max_val) * max_len)
+            bar_len = int((abs(val) / max_val) * max_len)
             bar = "█" * bar_len
-            lines.append(f"{label:10} | {bar} {val}")
+            sign = "-" if val < 0 else ""
+            lines.append(f"{label[:20]:20} | {sign}{bar} {val:.2f}")
 
         return "\n".join(lines)
-
     # ======================================================================
     # Compose final Slack message
     # ======================================================================
