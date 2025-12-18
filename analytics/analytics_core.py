@@ -183,10 +183,6 @@ def _sanitize_division_by_zero(sql: str) -> str:
     GUARANTEE: no placeholders ever break SQL
     """
 
-    # 🆕 1. Якщо SAFE_DIVIDE вже є — НЕ чіпаємо взагалі
-    if "SAFE_DIVIDE" in sql.upper():
-        return sql
-
     strings = {}
 
     def protect(m):
@@ -212,17 +208,21 @@ def _sanitize_division_by_zero(sql: str) -> str:
         sql,
     )
 
-    # 🆕 2. НЕ обробляємо агрегати типу SUM(a) / SUM(b)
+    # ✅ SAFE_DIVIDE тільки для простих a / b (БЕЗ дужок)
     sql = re.sub(
         r"""
         (?P<a>\b[\w\.]+\b)
         \s*/\s*
         (?P<b>\b[\w\.]+\b)
         """,
-        r"SAFE_DIVIDE(\g<a>, \g<b>)",
+        lambda m: (
+            m.group(0)
+            if "(" in m.group(0) or ")" in m.group(0)
+            else f"SAFE_DIVIDE({m.group('a')}, {m.group('b')})"
+        ),
         sql,
         flags=re.VERBOSE,
-    )
+)
 
     # 🔓 restore (best-effort)
     for k, v in strings.items():
