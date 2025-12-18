@@ -208,60 +208,21 @@ def _sanitize_division_by_zero(sql: str) -> str:
         sql,
     )
 
-    # ✅ SAFE_DIVIDE тільки для простих a / b (БЕЗ дужок)
+    # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
         r"""
-        (?P<a>\b[\w\.]+\b)
+        (?P<a>\([^()]+\)|\b[\w\.]+\b)
         \s*/\s*
-        (?P<b>\b[\w\.]+\b)
+        (?P<b>\([^()]+\)|\b[\w\.]+\b)
         """,
-        lambda m: (
-            m.group(0)
-            if "(" in m.group(0) or ")" in m.group(0)
-            else f"SAFE_DIVIDE({m.group('a')}, {m.group('b')})"
-        ),
+        r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE,
-)
+    )
 
     # 🔓 restore (best-effort)
     for k, v in strings.items():
         sql = sql.replace(k, v)
-
-    return sql
-
-def _normalize_safe_divide(sql: str) -> str:
-    """
-    Normalize SAFE_DIVIDE double parentheses produced by LLMs
-    """
-
-    return re.sub(
-        r"SAFE_DIVIDE\s*\(\s*\((.*?)\)\s*,\s*\((.*?)\)\s*\)",
-        r"SAFE_DIVIDE(\1, \2)",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-def _fix_double_function_call_parentheses(sql: str) -> str:
-    """
-    Fix LLM pattern: SAFE_DIVIDE(...)(100) -> SAFE_DIVIDE(...) * 100
-    Also drop accidental string second-call: CURRENT_DATE('tz')('tz') -> CURRENT_DATE('tz')
-    """
-
-    # 1) SAFE_DIVIDE(...)(100)  -> SAFE_DIVIDE(...) * 100
-    sql = re.sub(
-        r"(SAFE_DIVIDE\s*\((?:[^()]+|\([^()]*\))*\))\s*\(\s*(\d+(?:\.\d+)?)\s*\)",
-        r"\1 * \2",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # 2) If any function call is followed by ('something') again -> keep only first call
-    sql = re.sub(
-        r"(\b[A-Z_]+\s*\((?:[^()]+|\([^()]*\))*\))\s*\(\s*'[^']*'\s*\)",
-        r"\1",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
 
     return sql
 # ──────────────────────────────────────────────────────────────────────────────
@@ -453,8 +414,6 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
-    sql = _normalize_safe_divide(sql)
-    sql = _fix_double_function_call_parentheses(sql)
 
     return sql
 
@@ -487,6 +446,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
+
     # ======================================================================
     # TABLE RENDER (MARKDOWN)
     # ======================================================================
@@ -558,7 +518,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
 
         return "\n".join(lines)
-        
+
     # ======================================================================
     # Compose final Slack message
     # ======================================================================
