@@ -177,61 +177,6 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     return sql_query
 
-def strip_unknown_fields(sql: str, allowed_columns: set) -> str:
-    """
-    HARD HOTFIX:
-    - видаляє невідомі колонки з SELECT, WHERE, GROUP BY, ORDER BY
-    - рятує від Unrecognized name
-    """
-
-    tokens = re.findall(r"\b([a-zA-Z_][\w]*)\b", sql)
-
-    unknown = {
-        t for t in tokens
-        if t not in allowed_columns
-        and t.upper() not in {
-            "SELECT", "FROM", "WHERE", "AND", "OR", "AS",
-            "GROUP", "BY", "ORDER", "LIMIT",
-            "SUM", "COUNT", "AVG", "MIN", "MAX",
-            "ON", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
-            "SAFE_DIVIDE", "DATE", "CURRENT_DATE"
-        }
-    }
-
-    for col in unknown:
-        # прибрати з SELECT
-        sql = re.sub(rf"\b{col}\b\s*,?", "", sql, flags=re.IGNORECASE)
-
-        # прибрати WHERE / AND
-        sql = re.sub(
-            rf"\s+(AND|WHERE)\s+{col}\s*[=<>!]+\s*[^)\s]+",
-            "",
-            sql,
-            flags=re.IGNORECASE,
-        )
-
-        # прибрати GROUP BY
-        sql = re.sub(
-            rf"(GROUP\s+BY[^;]*)\b{col}\b\s*,?",
-            r"\1",
-            sql,
-            flags=re.IGNORECASE,
-        )
-
-        # прибрати ORDER BY
-        sql = re.sub(
-            rf"(ORDER\s+BY[^;]*)\b{col}\b\s*,?",
-            r"\1",
-            sql,
-            flags=re.IGNORECASE,
-        )
-
-    # косметика
-    sql = re.sub(r",\s*,", ",", sql)
-    sql = re.sub(r",\s*(FROM|WHERE|GROUP|ORDER)", r" \1", sql)
-
-    return sql
-
 def _sanitize_division_by_zero(sql: str) -> str:
     """
     SAFE: replaces a / b -> SAFE_DIVIDE(a, b)
@@ -455,8 +400,6 @@ COST_TABLE    = `{COST_TABLE_REF}`
 - Використовуй CURRENT_DATE('{LOCAL_TZ}').
 - Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
 - Поверни лише SQL без пояснень і без Markdown.
-- Якщо потрібно ділення — ВИКОРИСТОВУЙ ТІЛЬКИ SAFE_DIVIDE(a, b)
-
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -471,8 +414,6 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
-    allowed_cols = {c["name"] for c in rev_schema} | {c["name"] for c in cost_schema}
-    sql = strip_unknown_fields(sql, allowed_cols)
 
     return sql
 
@@ -486,15 +427,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         return "Повідомлення порожнє."
 
     matched = find_matches_with_ai(instruction_part, smap)
-
-    # беремо схеми і дозволені колонки
-    rev_schema, cost_schema = get_all_schemas()
-    allowed_cols = {c["name"].lower() for c in rev_schema} | {c["name"].lower() for c in cost_schema}
-
-    # додаємо тільки ті фільтри, де поле реально існує
     for field, value in matched:
-        if field and field.lower() in allowed_cols:
-            instruction_part += f" ({field}='{value}')"
+        instruction_part += f" ({field}='{value}')"
 
     sql_query = generate_sql(instruction_part, smap)
 
@@ -509,55 +443,73 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if df.empty:
         return "Результат порожній."
 
+    # Якщо BigQuery повернув одну колонку з f0_
     if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
         df = df.rename(columns={df.columns[0]: "value"})
 
+    # ======================================================================
+    # TABLE RENDER (MARKDOWN)
+    # ======================================================================
     def render_table(df: pd.DataFrame) -> str:
-        col_widths = {col: max(df[col].astype(str).map(len).max(), len(col)) for col in df.columns}
+        col_widths = {
+            col: max(df[col].astype(str).map(len).max(), len(col))
+            for col in df.columns
+        }
+
         header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
         separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
+
         rows = []
         for _, row in df.iterrows():
             rows.append("| " + " | ".join(f"{str(row[col]):{col_widths[col]}}" for col in df.columns) + " |")
+
         return "\n".join([header, separator] + rows)
 
+    # ======================================================================
+    # ASCII CHART
+    # ======================================================================
     def render_ascii_chart(df: pd.DataFrame) -> str:
         import numpy as np
-        if df.shape[0] <= 1:
-            return ""
+
+        # numeric value column
         num_cols = df.select_dtypes(include=["float", "int"]).columns
         if len(num_cols) == 0:
             return ""
+
         val_col = num_cols[0]
-        label_cols = [c for c in df.columns if "date" in c.lower() or "month" in c.lower()]
-        if not label_cols:
-            label_cols = [df.columns[0]]
-        label_col = label_cols[0]
+
+        # date-like label column
+        date_cols = [c for c in df.columns if "date" in c.lower() or "month" in c.lower()]
+        if len(date_cols) == 0:
+            date_cols = [df.columns[0]]
+
+        x_col = date_cols[0]
 
         values = df[val_col].fillna(0).tolist()
-        labels = df[label_col].astype(str).tolist()
-        pairs = list(zip(labels, values))
-        if not pairs:
-            return ""
+        labels = df[x_col].astype(str).tolist()
 
-        pairs = sorted(pairs, key=lambda x: abs(x[1]), reverse=True)[:10]
-        labels, values = zip(*pairs)
+        max_len = 40
+        max_val = max(values) if max(values) > 0 else 1
 
-        max_len = 30
-        max_val = max(abs(v) for v in values) or 1
-
-        lines = ["📈 *ASCII графік (TOP-10)*"]
+        lines = ["📈 *ASCII графік*"]
         for label, val in zip(labels, values):
-            bar_len = int((abs(val) / max_val) * max_len)
+            bar_len = int((val / max_val) * max_len)
             bar = "█" * bar_len
-            sign = "-" if val < 0 else ""
-            lines.append(f"{label[:20]:20} | {sign}{bar} {val:.2f}")
+            lines.append(f"{label:10} | {bar} {val}")
+
         return "\n".join(lines)
 
+    # ======================================================================
+    # Compose final Slack message
+    # ======================================================================
     table_md = render_table(df)
     ascii_md = render_ascii_chart(df)
+
     final_display = f"```\n{table_md}\n```\n{ascii_md}"
 
+    # ======================================================================
+    # Vertex analysis — unchanged
+    # ======================================================================
     analysis_prompt = f"""
 Проаналізуй результат CSV нижче:
 
@@ -569,6 +521,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 Зроби короткий висновок (3–4 речення).
 """
     resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
+
     return final_display + "\n\n" + resp.text.strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY
