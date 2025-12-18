@@ -241,6 +241,29 @@ def _normalize_safe_divide(sql: str) -> str:
         sql,
         flags=re.IGNORECASE | re.DOTALL,
     )
+def _fix_double_function_call_parentheses(sql: str) -> str:
+    """
+    Fix LLM pattern: SAFE_DIVIDE(...)(100) -> SAFE_DIVIDE(...) * 100
+    Also drop accidental string second-call: CURRENT_DATE('tz')('tz') -> CURRENT_DATE('tz')
+    """
+
+    # 1) SAFE_DIVIDE(...)(100)  -> SAFE_DIVIDE(...) * 100
+    sql = re.sub(
+        r"(SAFE_DIVIDE\s*\((?:[^()]+|\([^()]*\))*\))\s*\(\s*(\d+(?:\.\d+)?)\s*\)",
+        r"\1 * \2",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # 2) If any function call is followed by ('something') again -> keep only first call
+    sql = re.sub(
+        r"(\b[A-Z_]+\s*\((?:[^()]+|\([^()]*\))*\))\s*\(\s*'[^']*'\s*\)",
+        r"\1",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    return sql
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -431,6 +454,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
     sql = _normalize_safe_divide(sql)
+    sql = _fix_double_function_call_parentheses(sql)
 
     return sql
 
