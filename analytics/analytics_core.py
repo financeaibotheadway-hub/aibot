@@ -229,6 +229,18 @@ def _sanitize_division_by_zero(sql: str) -> str:
         sql = sql.replace(k, v)
 
     return sql
+
+def _normalize_safe_divide(sql: str) -> str:
+    """
+    Normalize SAFE_DIVIDE double parentheses produced by LLMs
+    """
+
+    return re.sub(
+        r"SAFE_DIVIDE\s*\(\s*\((.*?)\)\s*,\s*\((.*?)\)\s*\)",
+        r"SAFE_DIVIDE(\1, \2)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 # ──────────────────────────────────────────────────────────────────────────────
 # FIX WINDOW ORDER BY ERRORS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -418,6 +430,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+    sql = _normalize_safe_divide(sql)
 
     return sql
 
