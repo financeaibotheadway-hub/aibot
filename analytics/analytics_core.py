@@ -48,6 +48,38 @@ REVENUE_METRICS = {
     "gross_usd", "total_revenue"
 }
 
+EVENT_TYPE_BY_INTENT = {
+    "trial": "trial",
+    "тріал": "trial",
+
+    "subscription": "sale",
+    "subscriptions": "sale",
+    "підписка": "sale",
+    "підписки": "sale",
+    "purchase": "sale",
+    "покупка": "sale",
+
+    "vat": "vat",
+    "tax": "vat",
+
+    "refund": "refund",
+    "refunds": "refund",
+    "повернення": "refund",
+
+    "chargeback": "chargeback",
+    "чарджбек": "chargeback",
+
+    "commission": "commission",
+    "комісія": "commission",
+}
+
+def detect_event_type(text: str) -> str | None:
+    text = text.lower()
+    for keyword, event_type in EVENT_TYPE_BY_INTENT.items():
+        if keyword in text:
+            return event_type
+    return None
+
 # ──────────────────────────────────────────────────────────────────────────────
 # INIT CLIENTS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -451,8 +483,17 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
-    if metric in REVENUE_METRICS and _schema_has_column(rev_schema, "event_type"):
-        if "event_type" not in sql.lower():
+    event_type = detect_event_type(instruction_part)
+
+    if _schema_has_column(rev_schema, "event_type"):
+
+        # 1️⃣ Явно вказаний тип івенту (trial / vat / refund / etc)
+        if event_type:
+            if f"event_type = '{event_type}'" not in sql.lower():
+                sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+
+        # 2️⃣ Підписки / subscriptions → ЗАВЖДИ sale
+        elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
     return sql
