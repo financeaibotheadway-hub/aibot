@@ -42,6 +42,11 @@ logger = logging.getLogger("ai-bot")
 
 RETURN_SQL_ON_ERROR = os.getenv("RETURN_SQL_ON_ERROR", "false").lower() == "true"
 
+REVENUE_METRICS = {
+    "revenue", "gmv", "gross_revenue",
+    # якщо detect_metric повертає такі варіанти — лиши
+    "gross_usd", "total_revenue"
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INIT CLIENTS
@@ -86,6 +91,37 @@ def get_all_schemas():
         cost_schema = []
     return rev_schema, cost_schema
 
+def _schema_has_column(schema_list, col_name: str) -> bool:
+    col_name = col_name.lower()
+    return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
+
+def _ensure_where_filter(sql: str, condition_sql: str) -> str:
+    """
+    Adds condition into SQL:
+    - if WHERE exists -> inject "condition AND ..."
+    - else -> add "WHERE condition" right after first FROM <table>
+    """
+    sql_lower = sql.lower()
+
+    if condition_sql.lower() in sql_lower:
+        return sql
+
+    if " where " in f" {sql_lower} ":
+        return re.sub(
+            r"\bwhere\b",
+            f"WHERE {condition_sql} AND",
+            sql,
+            flags=re.IGNORECASE,
+            count=1,
+        )
+
+    return re.sub(
+        r"(\bfrom\b\s+`?[\w\-\.:]+`?)",
+        r"\1 WHERE " + condition_sql,
+        sql,
+        flags=re.IGNORECASE,
+        count=1,
+    )
 
 # >>> preload
 _ = get_all_schemas()
@@ -414,6 +450,10 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+
+    if metric in REVENUE_METRICS and _schema_has_column(rev_schema, "event_type"):
+        if "event_type" not in sql.lower():
+            sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
     return sql
 
