@@ -16,6 +16,23 @@ from cachetools import TTLCache
 from analytics import run_analysis
 from semantic_map import semantic_map
 
+# ──────────────────────────────────────────────────────────────────────────────
+# SHARED MESSAGE PIPELINE (DEV + PROD)
+# ──────────────────────────────────────────────────────────────────────────────
+def process_slack_message(
+    text: str,
+    user_id: str = "slack",
+):
+    """
+    ЄДИНА точка входу для обробки Slack-повідомлення.
+    Використовується і в PROD (FastAPI), і в DEV (Socket / Colab).
+    """
+    response = run_analysis(
+        message=text,
+        semantic_map_override=semantic_map,
+        user_id=user_id,
+    )
+    return response
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV / LOG
@@ -118,8 +135,10 @@ async def _respond_async(user_text: str, channel: str, user_id: str, thread_ts: 
 
     try:
         response = await asyncio.to_thread(
-            run_analysis, user_text, semantic_map, user_id
-        )
+        process_slack_message,
+        text=user_text,
+        user_id=user_id,
+    )
     except Exception as e:
         logger.exception("Error in run_analysis()")
         response = f"❌ Помилка: {str(e)}"
