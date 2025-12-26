@@ -12,3 +12,4 @@ db-dtypes
 cachetools
 sqlparse
 python-dateutil
+slack-bolt
