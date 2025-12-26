@@ -1,5 +1,6 @@
 # entrypoint.py
 import os
+import re
 
 MODE = os.getenv("BOT_MODE", "prod").lower()
 
@@ -8,17 +9,22 @@ if MODE == "dev":
     from slack_bolt import App
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-    from analytics.analytics_core import run_analysis
-    from semantic_map import semantic_map
+    from slack_handler import process_slack_message  # ✅ ЄДИНА логіка
 
     app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
+    def _strip_mention(text: str) -> str:
+        if not text:
+            return ""
+        return re.sub(r"^<@[\w]+>\s*", "", text).strip()
+
     @app.event("app_mention")
     def handle_mention(event, say):
-        text = event.get("text", "")
-        response = run_analysis(
-            message=text,
-            semantic_map_override=semantic_map,
+        raw_text = event.get("text", "")
+        text = _strip_mention(raw_text)
+
+        response = process_slack_message(
+            text=text,
             user_id=event.get("user", "slack"),
         )
         say(response)
