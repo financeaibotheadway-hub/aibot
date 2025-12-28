@@ -278,15 +278,16 @@ def _sanitize_division_by_zero(sql: str) -> str:
 
     # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
-        r"""
-        (?P<a>\([^()]+\)|\b[\w\.]+\b)
-        \s*/\s*
-        (?P<b>\([^()]+\)|\b[\w\.]+\b)
-        """,
-        r"SAFE_DIVIDE(\g<a>, \g<b>)",
-        sql,
-        flags=re.VERBOSE,
-    )
+    r"""
+    (?<!SAFE_DIVIDE\()
+    (?P<a>\([^()]+\)|\b[\w\.]+\b)
+    \s*/\s*
+    (?P<b>\([^()]+\)|\b[\w\.]+\b)
+    """,
+    r"SAFE_DIVIDE(\g<a>, \g<b>)",
+    sql,
+    flags=re.VERBOSE,
+)
 
     # 🔓 restore (best-effort)
     for k, v in strings.items():
@@ -346,7 +347,28 @@ def execute_cached_query(sql_query: str):
     query_cache[cache_key] = (df.copy(), now)
     return df
 
+def is_incomplete_comparison(df: pd.DataFrame, instruction: str) -> bool:
+    """
+    True, якщо користувач питає про порівняння типів revenue,
+    але результат містить лише один тип (через фільтри).
+    """
+    instruction = instruction.lower()
 
+    comparison_markers = (
+        "ретейн",
+        "retained",
+        "new",
+        "який тип",
+        "переважає",
+        "vs",
+        "чи"
+    )
+
+    if any(m in instruction for m in comparison_markers):
+        if "revenue_type" in df.columns and df["revenue_type"].nunique() < 2:
+            return True
+
+    return False
 # ──────────────────────────────────────────────────────────────────────────────
 # AI FIELD MATCHING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -611,25 +633,50 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     # ======================================================================
     # Vertex analysis — unchanged
     # ======================================================================
-    analysis_prompt = f"""
-        Проаналізуй результат аналітичного запиту нижче.
-        ЗАБОРОНЕНО:
-        - згадувати CSV або файли
-        - писати "лише один бізнес у даних"
-        - робити припущення про повний датасет
-        
-        Це агрегований результат виконання SQL-запиту до бази даних.
-        Результат може містити один або кілька рядків залежно від умов фільтрації та групування.
-        
-        Дані:
-        {df.to_csv(index=False)}
-        
-        Запит користувача:
-        "{instruction_part}"
-        
-        Зроби короткий висновок (3–4 речення), описуючи ТІЛЬКИ те, що реально показано в результаті.
-        Не роби припущень про повноту або неповноту даних.
+    # ======================================================================
+    # Vertex analysis
+    # ======================================================================
+    if is_incomplete_comparison(df, instruction_part):
+        analysis_prompt = f"""
+УВАГА: Результат цього запиту містить лише ОДИН тип revenue_type.
+
+Це означає, що дані були відфільтровані або агреговані так,
+що порівняння між типами revenue (наприклад Retained vs New)
+на основі цього результату є некоректним.
+
+Дані:
+{df.to_csv(index=False)}
+
+Запит користувача:
+"{instruction_part}"
+
+Зроби обережний висновок:
+- не стверджуй, що інший тип revenue відсутній у бізнесі
+- поясни, що для коректного порівняння потрібні дані по ОБОХ типах
 """
+    else:
+        analysis_prompt = f"""
+Проаналізуй результат аналітичного запиту нижче.
+ЗАБОРОНЕНО:
+- згадувати CSV або файли
+- писати "лише один бізнес у даних"
+- робити припущення про повний датасет
+
+Це агрегований результат виконання SQL-запиту.
+
+Дані:
+{df.to_csv(index=False)}
+
+Запит користувача:
+"{instruction_part}"
+
+Зроби короткий висновок (3–4 речення), описуючи ТІЛЬКИ те,
+що реально показано в результаті.
+"""
+
+    resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
+    return final_display + "\n\n" + resp.text.strip()
+    
     resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
 
     return final_display + "\n\n" + resp.text.strip()
