@@ -278,16 +278,18 @@ def _sanitize_division_by_zero(sql: str) -> str:
 
     # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
-    r"""
-    (?<!SAFE_DIVIDE\()
-    (?P<a>\([^()]+\)|\b[\w\.]+\b)
-    \s*/\s*
-    (?P<b>\([^()]+\)|\b[\w\.]+\b)
-    """,
-    r"SAFE_DIVIDE(\g<a>, \g<b>)",
-    sql,
-    flags=re.VERBOSE,
-)
+        r"""
+        (?<!SAFE_DIVIDE\()
+        (?<!SAFE_DIVIDE\([^)]*)
+        (?P<a>\([^()]+\)|\b[\w\.]+\b)
+        \s*/\s*
+        (?P<b>\([^()]+\)|\b[\w\.]+\b)
+        """,
+        r"SAFE_DIVIDE(\g<a>, \g<b>)",
+        sql,
+        flags=re.VERBOSE,
+    )lags=re.VERBOSE,
+    )
 
     # 🔓 restore (best-effort)
     for k, v in strings.items():
