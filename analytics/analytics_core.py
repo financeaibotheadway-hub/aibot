@@ -420,8 +420,33 @@ def find_matches_with_ai(instruction, smap):
 # ──────────────────────────────────────────────────────────────────────────────
 # SPLIT
 # ──────────────────────────────────────────────────────────────────────────────
+def _has_filter_only_tail(text: str) -> bool:
+    """
+    True якщо фраза типу:
+    - "за контрагентом X"
+    - "по контрагенту X"
+    - "for vendor X"
+    і немає сполучників типу "і", "та", "also"
+    """
+    t = text.lower()
+
+    filter_patterns = [
+        r"за\s+контрагентом\s+\w+",
+        r"по\s+контрагенту\s+\w+",
+        r"by\s+vendor\s+\w+",
+        r"for\s+vendor\s+\w+",
+    ]
+
+    has_filter = any(re.search(p, t) for p in filter_patterns)
+    has_split_words = re.search(r"\b(і|та|also|and)\b", t)
+
+    return has_filter and not has_split_words
+    
 def split_into_separate_queries(message: str) -> list:
     if extract_account_no(message) is not None:
+        return [message]
+
+    if _has_filter_only_tail(message):
         return [message]
 
     try:
