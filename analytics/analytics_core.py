@@ -196,7 +196,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
 
     # CURRENT_DATE without ()
     sql_query = re.sub(
-        r"\bCURRENT_DATE\b\s*(?!\()"
+        r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
         sql_query,
         flags=re.IGNORECASE,
