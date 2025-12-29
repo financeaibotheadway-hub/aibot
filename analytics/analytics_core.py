@@ -288,7 +288,6 @@ def _sanitize_division_by_zero(sql: str) -> str:
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE,
-    )lags=re.VERBOSE,
     )
 
     # 🔓 restore (best-effort)
@@ -508,20 +507,35 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = _sanitize_division_by_zero(sql)
 
     event_type = detect_event_type(instruction_part)
-
+    
+    comparison_markers = (
+        "ретейн",
+        "retained",
+        "new",
+        "який тип",
+        "переважає",
+        "vs",
+        "чи",
+        "відсоток",
+    )
+    
+    is_comparison_question = any(
+        m in instruction_part.lower()
+        for m in comparison_markers
+    )
+    
     if _schema_has_column(rev_schema, "event_type"):
-
-        # 1️⃣ Явно вказаний тип івенту (trial / vat / refund / etc)
-        if event_type:
+    
+        # ❗ НЕ фільтруємо event_type для порівняльних питань
+        if event_type and not is_comparison_question:
             if f"event_type = '{event_type}'" not in sql.lower():
                 sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
-
+    
         # 2️⃣ Підписки / subscriptions → ЗАВЖДИ sale
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
-
+    
     return sql
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
@@ -678,10 +692,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
     resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
     return final_display + "\n\n" + resp.text.strip()
-    
-    resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
 
-    return final_display + "\n\n" + resp.text.strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY
 # ──────────────────────────────────────────────────────────────────────────────
