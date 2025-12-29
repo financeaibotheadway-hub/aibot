@@ -48,6 +48,22 @@ REVENUE_METRICS = {
     "gross_usd", "total_revenue"
 }
 
+def extract_account_no(text: str) -> int | None:
+    """
+    Явно дістаємо account_no з фраз типу:
+    - рахунок 949091
+    - по рахунку 949091
+    - account 949091
+    - acct 949091
+    """
+    m = re.search(
+        r"(рахунк(у|ом)?|account|acct)\s*(№|number)?\s*(\d{4,10})",
+        text.lower()
+    )
+    if m:
+        return int(m.group(4))
+    return None
+
 EVENT_TYPE_BY_INTENT = {
     "trial": "trial",
     "тріал": "trial",
@@ -418,7 +434,8 @@ def generate_sql(instruction_part: str, smap) -> str:
     Тут ми вставляємо metric_parser.detect_metric + metric_loader.get_metrics
     і даємо SQL-генерації підказку з метрикою.
     """
-
+        
+    account_no = extract_account_no(instruction_part)
     # 1. Детекція метрики
     metric = detect_metric(instruction_part)
     metrics = get_metrics()
@@ -486,18 +503,17 @@ COST_TABLE    = `{COST_TABLE_REF}`
     event_type = detect_event_type(instruction_part)
 
     if _schema_has_column(rev_schema, "event_type"):
-
-        # 1️⃣ Явно вказаний тип івенту (trial / vat / refund / etc)
         if event_type:
             if f"event_type = '{event_type}'" not in sql.lower():
                 sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
-
-        # 2️⃣ Підписки / subscriptions → ЗАВЖДИ sale
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
-    return sql
+    # 🔴 КЛЮЧОВЕ: жорсткий фільтр по рахунку
+    if account_no is not None:
+        sql = _ensure_where_filter(sql, f"account_no = {account_no}")
 
+    return sql
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
