@@ -566,7 +566,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
         flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
-    if "SAFE_DIVIDE" not in sql.upper():
+    if "/" in sql and "SAFE_DIVIDE" not in sql.upper():
         sql = _sanitize_division_by_zero(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
 
