@@ -500,7 +500,8 @@ COST_TABLE    = `{COST_TABLE_REF}`
         r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
         "",
         sql,
-        flags=re.IGNORECASE | re.MULTILINE,)
+        flags=re.IGNORECASE | re.MULTILINE
+    )
 
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
