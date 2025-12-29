@@ -511,9 +511,9 @@ def generate_sql(instruction_part: str, smap) -> str:
         return f"""
         SELECT
           SAFE_DIVIDE(
-            COUNTIF(LOWER(subscription_name) LIKE '%trial%'),
+            COUNTIF(LOWER(subscription_name) LIKE '%trial%') * 100,
             COUNT(*)
-          ) * 100 AS percentage_trial_subscriptions
+          ) AS percentage_trial_subscriptions
         FROM `{REVENUE_TABLE_REF}`
         WHERE DATE(created_at) BETWEEN '{start}' AND '{end}'
         """.strip()
