@@ -410,6 +410,12 @@ def find_matches_with_ai(instruction, smap):
 # SPLIT
 # ──────────────────────────────────────────────────────────────────────────────
 def split_into_separate_queries(message: str) -> list:
+    acc = _extract_account_no(message)
+    yr  = _extract_year(message)
+    if acc and yr and _looks_like_total_cost_question(message):
+        return [message]
+    if message.count("?") <= 1 and "\n" not in message:
+        return [message]    
     try:
         prompt = f"""
 Розбий текст на окремі запити:
@@ -691,6 +697,11 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 # MAIN ENTRY
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
+    acc = _extract_account_no(message)
+    yr  = _extract_year(message)
+    if acc and yr and _looks_like_total_cost_question(message):
+        return execute_single_query(message, smap, user_id)
+
     queries = split_into_separate_queries(message)
 
     if len(queries) == 1:
