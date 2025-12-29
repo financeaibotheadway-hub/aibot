@@ -73,36 +73,6 @@ EVENT_TYPE_BY_INTENT = {
     "комісія": "commission",
 }
 
-def _extract_account_no(text: str):
-    # під 949091 / 949 091 / 949091.00
-    m = re.search(r"\b(\d{3})\s?(\d{3})\b", text.replace(".", ""))
-    if m:
-        return int(m.group(1) + m.group(2))
-    m = re.search(r"\b(\d{5,10})\b", text)
-    return int(m.group(1)) if m else None
-
-
-def _extract_year(text: str):
-    m = re.search(r"\b(20\d{2})\b", text)
-    return int(m.group(1)) if m else None
-
-
-def _looks_like_total_cost_question(text: str) -> bool:
-    t = text.lower()
-    return (
-        ("скільки" in t or "сума" in t or "total" in t)
-        and ("витрат" in t or "витрати" in t or "cost" in t or "spend" in t)
-        and ("рахунк" in t or "account" in t)
-    )
-def _looks_like_percentage_question(text: str) -> bool:
-    t = text.lower()
-    return (
-        ("відсоток" in t or "percent" in t or "%" in t)
-        and ("trial" in t)
-        and ("підпис" in t or "subscription" in t)
-        and _extract_year(t) is not None
-    )
-    
 def detect_event_type(text: str) -> str | None:
     text = text.lower()
     for keyword, event_type in EVENT_TYPE_BY_INTENT.items():
@@ -225,9 +195,8 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     )
 
     # CURRENT_DATE without ()
-    # ❗ не чіпати CURRENT_DATE('Europe/Kyiv')
     sql_query = re.sub(
-        r"\bCURRENT_DATE\b(?!\s*\()(?!\s*')",
+        r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
         sql_query,
         flags=re.IGNORECASE,
@@ -294,7 +263,7 @@ def _sanitize_division_by_zero(sql: str) -> str:
 
     # 🔒 protect date/time functions
     sql = re.sub(
-        r"\b(DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
+        r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
         protect,
         sql,
         flags=re.IGNORECASE,
@@ -419,17 +388,6 @@ def find_matches_with_ai(instruction, smap):
 # SPLIT
 # ──────────────────────────────────────────────────────────────────────────────
 def split_into_separate_queries(message: str) -> list:
-    acc = _extract_account_no(message)
-    yr  = _extract_year(message)
-    
-    if acc and yr and _looks_like_total_cost_question(message):
-        return [message]
-        
-    if _looks_like_percentage_question(message):
-        return [message]
-        
-    if message.count("?") <= 1 and "\n" not in message:
-        return [message] 
     try:
         prompt = f"""
 Розбий текст на окремі запити:
@@ -473,50 +431,6 @@ def generate_sql(instruction_part: str, smap) -> str:
     rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
     cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
 
-    acc = _extract_account_no(instruction_part)
-    yr = _extract_year(instruction_part)
-
-    if acc and yr and _looks_like_total_cost_question(instruction_part):
-        start = f"{yr}-01-01"
-        end = f"{yr}-12-31"
-
-        text_l = instruction_part.lower()
-
-        # по місяцях
-        if "по місяц" in text_l or "by month" in text_l:
-            return f"""
-            SELECT
-              FORMAT_DATE('%Y-%m', DATE(posting_date)) AS month,
-              SUM(amount_lcy) AS total_cost
-            FROM `{COST_TABLE_REF}`
-            WHERE account_no = {acc}
-              AND DATE(posting_date) BETWEEN '{start}' AND '{end}'
-            GROUP BY month
-            ORDER BY month
-            """.strip()
-
-        # загальна сума
-        return f"""
-        SELECT
-          SUM(amount_lcy) AS total_cost
-        FROM `{COST_TABLE_REF}`
-        WHERE account_no = {acc}
-          AND DATE(posting_date) BETWEEN '{start}' AND '{end}'
-        """.strip()
-    if _looks_like_percentage_question(instruction_part):
-        yr = _extract_year(instruction_part)
-        start = f"{yr}-01-01"
-        end   = f"{yr}-12-31"
-    
-        return f"""
-        SELECT
-          SAFE_DIVIDE(
-            COUNTIF(LOWER(subscription_name) LIKE '%trial%') * 100,
-            COUNT(*)
-          ) AS percentage_trial_subscriptions
-        FROM `{REVENUE_TABLE_REF}`
-        WHERE DATE(created_at) BETWEEN '{start}' AND '{end}'
-        """.strip()
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання:
 
@@ -566,9 +480,8 @@ COST_TABLE    = `{COST_TABLE_REF}`
         flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
-    if "/" in sql and "SAFE_DIVIDE" not in sql.upper():
-        sql = _sanitize_division_by_zero(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
+    sql = _sanitize_division_by_zero(sql)
 
     event_type = detect_event_type(instruction_part)
 
@@ -724,11 +637,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 # MAIN ENTRY
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
-    acc = _extract_account_no(message)
-    yr  = _extract_year(message)
-    if acc and yr and _looks_like_total_cost_question(message):
-        return execute_single_query(message, smap, user_id)
-
     queries = split_into_separate_queries(message)
 
     if len(queries) == 1:
