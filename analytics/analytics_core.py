@@ -96,6 +96,17 @@ def detect_event_type(text: str) -> str | None:
             return event_type
     return None
 
+def _needs_breakdown(text: str) -> bool:
+    """
+    Чи просить користувач деталізацію / розбивку
+    """
+    keywords = [
+        "по ", "за ", "розбив", "breakdown",
+        "centers", "центрах", "категоріях"
+    ]
+    t = text.lower()
+    return any(k in t for k in keywords)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # INIT CLIENTS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -513,8 +524,16 @@ COST_TABLE    = `{COST_TABLE_REF}`
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
 
-    return sql
+    # 🔴 КЛЮЧОВЕ: якщо питають "скільки", а не "по чому" — прибираємо GROUP BY
+    if account_no is not None and not _needs_breakdown(instruction_part):
+        sql = re.sub(
+            r"\bGROUP\s+BY\b.+?$",
+            "",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL
+        )
 
+    return sql
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
 # ──────────────────────────────────────────────────────────────────────────────
