@@ -228,9 +228,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     # ❗ не чіпати CURRENT_DATE('Europe/Kyiv')
     sql_query = re.sub(
         r"\bCURRENT_DATE\b(?!\s*\()",
-        lambda m: m.group(0)
-        if re.search(r"\bCURRENT_DATE\s*\(", sql_query, re.IGNORECASE)
-        else f"CURRENT_DATE('{LOCAL_TZ}')",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
         sql_query,
         flags=re.IGNORECASE,
     )
