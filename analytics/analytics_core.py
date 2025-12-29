@@ -279,8 +279,6 @@ def _sanitize_division_by_zero(sql: str) -> str:
     # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
         r"""
-        (?<!SAFE_DIVIDE\()
-        (?<!SAFE_DIVIDE\([^)]*)
         (?P<a>\([^()]+\)|\b[\w\.]+\b)
         \s*/\s*
         (?P<b>\([^()]+\)|\b[\w\.]+\b)
@@ -348,28 +346,7 @@ def execute_cached_query(sql_query: str):
     query_cache[cache_key] = (df.copy(), now)
     return df
 
-def is_incomplete_comparison(df: pd.DataFrame, instruction: str) -> bool:
-    """
-    True, якщо користувач питає про порівняння типів revenue,
-    але результат містить лише один тип (через фільтри).
-    """
-    instruction = instruction.lower()
 
-    comparison_markers = (
-        "ретейн",
-        "retained",
-        "new",
-        "який тип",
-        "переважає",
-        "vs",
-        "чи"
-    )
-
-    if any(m in instruction for m in comparison_markers):
-        if "revenue_type" in df.columns and df["revenue_type"].nunique() < 2:
-            return True
-
-    return False
 # ──────────────────────────────────────────────────────────────────────────────
 # AI FIELD MATCHING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -500,43 +477,27 @@ COST_TABLE    = `{COST_TABLE_REF}`
         r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
         "",
         sql,
-        flags=re.IGNORECASE | re.MULTILINE
-    )
+        flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
     event_type = detect_event_type(instruction_part)
-    
-    comparison_markers = (
-        "ретейн",
-        "retained",
-        "new",
-        "який тип",
-        "переважає",
-        "vs",
-        "чи",
-        "відсоток",
-    )
-    
-    is_comparison_question = any(
-        m in instruction_part.lower()
-        for m in comparison_markers
-    )
-    
+
     if _schema_has_column(rev_schema, "event_type"):
-    
-        # ❗ НЕ фільтруємо event_type для порівняльних питань
-        if event_type and not is_comparison_question:
+
+        # 1️⃣ Явно вказаний тип івенту (trial / vat / refund / etc)
+        if event_type:
             if f"event_type = '{event_type}'" not in sql.lower():
                 sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
-    
+
         # 2️⃣ Підписки / subscriptions → ЗАВЖДИ sale
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
-    
+
     return sql
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY
@@ -650,50 +611,28 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     # ======================================================================
     # Vertex analysis — unchanged
     # ======================================================================
-    # ======================================================================
-    # Vertex analysis
-    # ======================================================================
-    if is_incomplete_comparison(df, instruction_part):
-        analysis_prompt = f"""
-УВАГА: Результат цього запиту містить лише ОДИН тип revenue_type.
-
-Це означає, що дані були відфільтровані або агреговані так,
-що порівняння між типами revenue (наприклад Retained vs New)
-на основі цього результату є некоректним.
-
-Дані:
-{df.to_csv(index=False)}
-
-Запит користувача:
-"{instruction_part}"
-
-Зроби обережний висновок:
-- не стверджуй, що інший тип revenue відсутній у бізнесі
-- поясни, що для коректного порівняння потрібні дані по ОБОХ типах
+    analysis_prompt = f"""
+        Проаналізуй результат аналітичного запиту нижче.
+        ЗАБОРОНЕНО:
+        - згадувати CSV або файли
+        - писати "лише один бізнес у даних"
+        - робити припущення про повний датасет
+        
+        Це агрегований результат виконання SQL-запиту до бази даних.
+        Результат може містити один або кілька рядків залежно від умов фільтрації та групування.
+        
+        Дані:
+        {df.to_csv(index=False)}
+        
+        Запит користувача:
+        "{instruction_part}"
+        
+        Зроби короткий висновок (3–4 речення), описуючи ТІЛЬКИ те, що реально показано в результаті.
+        Не роби припущень про повноту або неповноту даних.
 """
-    else:
-        analysis_prompt = f"""
-Проаналізуй результат аналітичного запиту нижче.
-ЗАБОРОНЕНО:
-- згадувати CSV або файли
-- писати "лише один бізнес у даних"
-- робити припущення про повний датасет
-
-Це агрегований результат виконання SQL-запиту.
-
-Дані:
-{df.to_csv(index=False)}
-
-Запит користувача:
-"{instruction_part}"
-
-Зроби короткий висновок (3–4 речення), описуючи ТІЛЬКИ те,
-що реально показано в результаті.
-"""
-
     resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
-    return final_display + "\n\n" + resp.text.strip()
 
+    return final_display + "\n\n" + resp.text.strip()
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY
 # ──────────────────────────────────────────────────────────────────────────────
