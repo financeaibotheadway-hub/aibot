@@ -496,6 +496,10 @@ COST_TABLE    = `{COST_TABLE_REF}`
 - Використовуй CURRENT_DATE('{LOCAL_TZ}').
 - Не пиши ORDER BY у window функціях, крім випадків, коли це LAG/LEAD (BigQuery вимагає ORDER BY для цих функцій).
 - Поверни лише SQL без пояснень і без Markdown.
+- Якщо запит починається зі "скільки" або "sum" — ЗАБОРОНЕНО використовувати GROUP BY.
+- Якщо запит про trial / тріали, то використовувати таблицю - `{REVENUE_TABLE_REF}`і в ній брати event_name = "sale" і product_id буде like "%product_id%".
+- Якщо запит про айді ранкухку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле account_no.
+
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -510,6 +514,34 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+
+    # ===============================
+    # HARD ENFORCEMENT (ANTI-HALLUCINATION)
+    # ===============================
+
+    # 1️⃣ Якщо є account_no → ТІЛЬКИ COST_TABLE
+    if account_no is not None:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError(
+                "INVALID SQL: revenue table used for account-based cost query"
+            )
+    
+    # 2️⃣ Якщо 'скільки' або 'sum' → ЗАБОРОНИТИ GROUP BY
+    if re.search(r"\b(скільки|sum|total)\b", instruction_part.lower()):
+        if re.search(r"\bGROUP\s+BY\b", sql, re.IGNORECASE):
+            sql = re.sub(
+                r"\bGROUP\s+BY\b.+?$",
+                "",
+                sql,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+    
+    # 3️⃣ Якщо витрати → ЗАБОРОНИТИ revenue table
+    if metric in {"cost", "opex", "expense", "expenses"}:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError(
+                "INVALID SQL: revenue table used for cost metric"
+            )
 
     event_type = detect_event_type(instruction_part)
 
