@@ -94,6 +94,14 @@ def _looks_like_total_cost_question(text: str) -> bool:
         and ("витрат" in t or "витрати" in t or "cost" in t or "spend" in t)
         and ("рахунк" in t or "account" in t)
     )
+def _looks_like_percentage_question(text: str) -> bool:
+    t = text.lower()
+    return (
+        ("відсоток" in t or "percent" in t or "%" in t)
+        and ("trial" in t)
+        and ("підпис" in t or "subscription" in t)
+        and _extract_year(t) is not None
+    )
     
 def detect_event_type(text: str) -> str | None:
     text = text.lower()
@@ -412,10 +420,15 @@ def find_matches_with_ai(instruction, smap):
 def split_into_separate_queries(message: str) -> list:
     acc = _extract_account_no(message)
     yr  = _extract_year(message)
+    
     if acc and yr and _looks_like_total_cost_question(message):
         return [message]
+        
+    if _looks_like_percentage_question(message):
+        return [message]
+        
     if message.count("?") <= 1 and "\n" not in message:
-        return [message]    
+        return [message] 
     try:
         prompt = f"""
 Розбий текст на окремі запити:
