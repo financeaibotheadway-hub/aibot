@@ -294,7 +294,7 @@ def _sanitize_division_by_zero(sql: str) -> str:
 
     # 🔒 protect date/time functions
     sql = re.sub(
-        r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
+        r"\b(DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
         protect,
         sql,
         flags=re.IGNORECASE,
@@ -472,9 +472,7 @@ def generate_sql(instruction_part: str, smap) -> str:
 
     rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
     cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
-    # ==========================================================
-    # ✅ HARD OVERRIDE: TOTAL COST BY ACCOUNT + YEAR (NO LLM)
-    # ==========================================================
+
     acc = _extract_account_no(instruction_part)
     yr = _extract_year(instruction_part)
 
@@ -504,6 +502,20 @@ def generate_sql(instruction_part: str, smap) -> str:
         FROM `{COST_TABLE_REF}`
         WHERE account_no = {acc}
           AND DATE(posting_date) BETWEEN '{start}' AND '{end}'
+        """.strip()
+    if _looks_like_percentage_question(instruction_part):
+        yr = _extract_year(instruction_part)
+        start = f"{yr}-01-01"
+        end   = f"{yr}-12-31"
+    
+        return f"""
+        SELECT
+          SAFE_DIVIDE(
+            COUNTIF(LOWER(subscription_name) LIKE '%trial%'),
+            COUNT(*)
+          ) * 100 AS percentage_trial_subscriptions
+        FROM `{REVENUE_TABLE_REF}`
+        WHERE DATE(created_at) BETWEEN '{start}' AND '{end}'
         """.strip()
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання:
@@ -554,8 +566,8 @@ COST_TABLE    = `{COST_TABLE_REF}`
         flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
-    sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+    sql = _sanitize_sql_dates(sql, date_cols)
 
     event_type = detect_event_type(instruction_part)
 
