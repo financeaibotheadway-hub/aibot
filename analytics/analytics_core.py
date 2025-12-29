@@ -73,6 +73,28 @@ EVENT_TYPE_BY_INTENT = {
     "комісія": "commission",
 }
 
+def _extract_account_no(text: str):
+    # під 949091 / 949 091 / 949091.00
+    m = re.search(r"\b(\d{3})\s?(\d{3})\b", text.replace(".", ""))
+    if m:
+        return int(m.group(1) + m.group(2))
+    m = re.search(r"\b(\d{5,10})\b", text)
+    return int(m.group(1)) if m else None
+
+
+def _extract_year(text: str):
+    m = re.search(r"\b(20\d{2})\b", text)
+    return int(m.group(1)) if m else None
+
+
+def _looks_like_total_cost_question(text: str) -> bool:
+    t = text.lower()
+    return (
+        ("скільки" in t or "сума" in t or "total" in t)
+        and ("витрат" in t or "витрати" in t or "cost" in t or "spend" in t)
+        and ("рахунк" in t or "account" in t)
+    )
+    
 def detect_event_type(text: str) -> str | None:
     text = text.lower()
     for keyword, event_type in EVENT_TYPE_BY_INTENT.items():
@@ -430,7 +452,39 @@ def generate_sql(instruction_part: str, smap) -> str:
 
     rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
     cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
+    # ==========================================================
+    # ✅ HARD OVERRIDE: TOTAL COST BY ACCOUNT + YEAR (NO LLM)
+    # ==========================================================
+    acc = _extract_account_no(instruction_part)
+    yr = _extract_year(instruction_part)
 
+    if acc and yr and _looks_like_total_cost_question(instruction_part):
+        start = f"{yr}-01-01"
+        end = f"{yr}-12-31"
+
+        text_l = instruction_part.lower()
+
+        # по місяцях
+        if "по місяц" in text_l or "by month" in text_l:
+            return f"""
+            SELECT
+              FORMAT_DATE('%Y-%m', DATE(posting_date)) AS month,
+              SUM(amount_lcy) AS total_cost
+            FROM `{COST_TABLE_REF}`
+            WHERE account_no = {acc}
+              AND DATE(posting_date) BETWEEN '{start}' AND '{end}'
+            GROUP BY month
+            ORDER BY month
+            """.strip()
+
+        # загальна сума
+        return f"""
+        SELECT
+          SUM(amount_lcy) AS total_cost
+        FROM `{COST_TABLE_REF}`
+        WHERE account_no = {acc}
+          AND DATE(posting_date) BETWEEN '{start}' AND '{end}'
+        """.strip()
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання:
 
