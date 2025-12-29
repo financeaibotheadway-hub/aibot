@@ -89,6 +89,14 @@ EVENT_TYPE_BY_INTENT = {
     "комісія": "commission",
 }
 
+def extract_year(text: str) -> int | None:
+    m = re.search(r"\b(20\d{2})\b", text)
+    if m:
+        y = int(m.group(1))
+        if 2000 <= y <= 2100:
+            return y
+    return None
+
 def detect_event_type(text: str) -> str | None:
     text = text.lower()
     for keyword, event_type in EVENT_TYPE_BY_INTENT.items():
@@ -97,12 +105,10 @@ def detect_event_type(text: str) -> str | None:
     return None
 
 def _needs_breakdown(text: str) -> bool:
-    """
-    Чи просить користувач деталізацію / розбивку
-    """
     keywords = [
-        "по ", "за ", "розбив", "breakdown",
-        "centers", "центрах", "категоріях"
+        "розбив", "breakdown",
+        "по центрах", "по категоріях",
+        "by center", "by category"
     ]
     t = text.lower()
     return any(k in t for k in keywords)
@@ -415,6 +421,9 @@ def find_matches_with_ai(instruction, smap):
 # SPLIT
 # ──────────────────────────────────────────────────────────────────────────────
 def split_into_separate_queries(message: str) -> list:
+    if extract_account_no(message) is not None:
+        return [message]
+
     try:
         prompt = f"""
 Розбий текст на окремі запити:
@@ -447,6 +456,7 @@ def generate_sql(instruction_part: str, smap) -> str:
     """
         
     account_no = extract_account_no(instruction_part)
+    year = extract_year(instruction_part)
     # 1. Детекція метрики
     metric = detect_metric(instruction_part)
     metrics = get_metrics()
@@ -514,6 +524,31 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+
+    if (
+        account_no is not None
+        and year is not None
+        and re.search(r"\b(скільки|sum|total)\b", instruction_part.lower())
+        and not _needs_breakdown(instruction_part)
+    ):
+        # беремо гарантовану колонку дати
+        preferred = ["posting_date", "date", "dt", "transaction_date"]
+        date_col = None
+        for c in preferred:
+            if _schema_has_column(cost_schema, c):
+                date_col = c
+                break
+    
+        if not date_col:
+            raise ValueError("No date column found in COST table")
+    
+        return f"""
+        SELECT
+            SUM(ABS(amount_lcy)) AS total_expenses
+        FROM `{COST_TABLE_REF}`
+        WHERE account_no = {account_no}
+          AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'
+        """.strip()
 
     # ===============================
     # HARD ENFORCEMENT (ANTI-HALLUCINATION)
