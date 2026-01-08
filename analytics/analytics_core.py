@@ -457,15 +457,12 @@ def fix_format_date(sql: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 def fix_empty_date_calls(sql: str) -> str:
     """
-    Fixes invalid DATE() calls with no arguments:
-    - DATE() ❌
-
-    Strategy:
-    - Replace DATE() → CURRENT_DATE('<LOCAL_TZ>')
+    Fixes invalid DATE() calls with no arguments
+    EVEN when nested inside other functions.
     """
 
     return re.sub(
-        r"\bDATE\s*\(\s*\)",
+        r"DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
         sql,
         flags=re.IGNORECASE,
