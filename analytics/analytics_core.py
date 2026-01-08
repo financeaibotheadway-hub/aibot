@@ -709,11 +709,6 @@ COST_TABLE    = `{COST_TABLE_REF}`
     
     # 3. МАТЕМАТИКА
     sql = _sanitize_division_by_zero(sql)
-
-    if re.search(r"\bFORMAT_DATE\s*\(", sql, re.IGNORECASE):
-        raise ValueError(
-            "INVALID SQL: FORMAT_DATE detected after sanitization"
-        )
         
     if (
         account_no is not None
@@ -817,7 +812,13 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         )
 
         if RETURN_SQL_ON_ERROR:
-            return f"❌ SQL GENERATION ERROR\n{msg}"
+            return (
+            "❌ SQL GENERATION ERROR\n"
+            "```sql\n"
+            f"{locals().get('sql', '-- SQL not generated --')}\n"
+            "```\n"
+            f"{msg}"
+        )
 
         return f"❌ Помилка генерації SQL:\n{msg}"
 
