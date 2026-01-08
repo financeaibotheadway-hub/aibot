@@ -478,9 +478,7 @@ def _has_filter_only_tail(text: str) -> bool:
     
 def split_into_separate_queries(message: str) -> list:
     
-    if re.search(r"\b(ростуть|зростають|падають|зменшуються).+чи.+(ростуть|зростають|падають|зменшуються)\b", message.lower()):
-        return [message]
-    if extract_account_no(message) is not None:
+    if extract_account_no(message) is not None and not is_trend_question(message):
         return [message]
 
     if _has_filter_only_tail(message):
