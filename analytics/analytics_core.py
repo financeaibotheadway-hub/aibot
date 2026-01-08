@@ -655,11 +655,16 @@ COST_TABLE    = `{COST_TABLE_REF}`
         sql,
         flags=re.IGNORECASE | re.MULTILINE,)
 
-    sql = fix_window_order_by(sql)
-    sql = fix_aggregation_violations(sql)
+    # 1. СИНТАКСИЧНІ ФІКСИ (НЕ МІНЯЮТЬ СТРУКТУРУ)
     sql = fix_format_date(sql)
     sql = fix_empty_date_calls(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
+    
+    # 2. СТРУКТУРНІ ФІКСИ
+    sql = fix_window_order_by(sql)
+    sql = fix_aggregation_violations(sql)
+    
+    # 3. МАТЕМАТИКА
     sql = _sanitize_division_by_zero(sql)
 
     if (
