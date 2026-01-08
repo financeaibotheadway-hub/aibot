@@ -312,13 +312,14 @@ def _sanitize_division_by_zero(sql: str) -> str:
     # ✅ SAFE_DIVIDE only for math
     sql = re.sub(
         r"""
+        (?<!SAFE_DIVIDE\()
         (?P<a>\([^()]+\)|\b[\w\.]+\b)
         \s*/\s*
         (?P<b>\([^()]+\)|\b[\w\.]+\b)
         """,
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
-        flags=re.VERBOSE,
+        flags=re.VERBOSE | re.IGNORECASE,
     )
 
     # 🔓 restore (best-effort)
@@ -667,7 +668,13 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if not instruction_part:
         return "Повідомлення порожнє."
         
-    if is_trend_question(instruction_part) and not has_explicit_date(instruction_part):
+    account_no = extract_account_no(instruction_part)
+    
+    if (
+        is_trend_question(instruction_part)
+        and not has_explicit_date(instruction_part)
+        and account_no is None
+       ):
         return (
             "❗ Для аналізу динаміки потрібен часовий період.\n\n"
             "Будь ласка, уточніть, наприклад:\n"
