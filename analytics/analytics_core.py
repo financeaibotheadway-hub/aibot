@@ -385,6 +385,12 @@ def has_explicit_date(text: str) -> bool:
         r")\b",
         text.lower()
     ))
+    
+def is_trend_question(text: str) -> bool:
+    return bool(re.search(
+        r"(рост|пад|зрост|зменш|динамік|trend|increase|decrease).*(чи|\?|vs|порівня)",
+        text.lower()
+    ))
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
@@ -661,14 +667,13 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if not instruction_part:
         return "Повідомлення порожнє."
         
-    if requires_date_range(instruction_part) and not has_explicit_date(instruction_part):
+    if is_trend_question(instruction_part) and not has_explicit_date(instruction_part):
         return (
-            "❗ Для аналізу змін у витратах потрібен часовий період.\n\n"
+            "❗ Для аналізу динаміки потрібен часовий період.\n\n"
             "Будь ласка, уточніть, наприклад:\n"
             "• за який місяць?\n"
             "• порівняння яких періодів?\n"
-            "• конкретний діапазон дат (від–до)\n\n"
-            "Без зазначення періоду я не можу зробити коректний висновок."
+            "• конкретний діапазон дат (від–до)"
         )
     
     matched = find_matches_with_ai(instruction_part, smap)
