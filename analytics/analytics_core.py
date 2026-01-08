@@ -361,6 +361,67 @@ def fix_window_order_by(sql: str) -> str:
         return f"{fn} OVER ({inside_fixed})"
 
     return pattern.sub(_add_order_by, sql)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX AGGREGATION ERRORS (SYSTEMIC)
+# ──────────────────────────────────────────────────────────────────────────────
+def fix_aggregation_violations(sql: str) -> str:
+    """
+    BigQuery requires:
+    - if SELECT contains aggregate functions,
+      all other selected columns must be aggregated or grouped.
+
+    Strategy:
+    - detect aggregate presence
+    - wrap non-aggregated scalar columns with ANY_VALUE()
+    """
+
+    sql_upper = sql.upper()
+
+    # 1. Чи є агрегати
+    if not re.search(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", sql_upper):
+        return sql  # не агрегатний запит — нічого не робимо
+
+    # 2. Витягуємо SELECT ... FROM
+    m = re.search(r"SELECT\s+(.*?)\s+FROM\s", sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return sql
+
+    select_block = m.group(1)
+
+    columns = []
+    for part in select_block.split(","):
+        part = part.strip()
+
+        # якщо вже агрегат або ANY_VALUE — пропускаємо
+        if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|ANY_VALUE)\s*\(", part, re.IGNORECASE):
+            columns.append(part)
+            continue
+
+        # якщо це константа — ок
+        if re.match(r"^\d+$", part):
+            columns.append(part)
+            continue
+
+        # якщо alias = агрегат
+        if re.search(r"\s+AS\s+", part, re.IGNORECASE):
+            left = part.split(" AS ")[0]
+            if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", left, re.IGNORECASE):
+                columns.append(part)
+                continue
+
+        columns.append(f"ANY_VALUE({part})")
+
+    fixed_select = "SELECT " + ", ".join(columns) + " FROM "
+
+    return re.sub(
+        r"SELECT\s+(.*?)\s+FROM\s",
+        fixed_select,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+        count=1,
+    )
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
@@ -547,6 +608,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
         flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
+    sql = fix_aggregation_violations(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
