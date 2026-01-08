@@ -467,6 +467,9 @@ def _has_filter_only_tail(text: str) -> bool:
     return has_filter and not has_split_words
     
 def split_into_separate_queries(message: str) -> list:
+    
+    if re.search(r"\b(ростуть|зростають|падають|зменшуються).+чи.+(ростуть|зростають|падають|зменшуються)\b", message.lower()):
+        return [message]
     if extract_account_no(message) is not None:
         return [message]
 
@@ -573,6 +576,34 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+
+    sql = re.sub(
+        r"\bFORMAT_DATE\s*\(\s*([^)]+)\s*\)",
+        r"FORMAT_DATE('%Y-%m-%d', \1)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    sql = re.sub(
+        r"\bDATE_TRUNC\s*\(\s*([^)]+?)\s*\)",
+        lambda m: (
+            m.group(0)
+            if "," in m.group(1)
+            else f"DATE_TRUNC({m.group(1)}, MONTH)"
+        ),
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    if re.search(
+        r"\bWHERE\b.*\b(LAG|LEAD|ROW_NUMBER|RANK|DENSE_RANK)\s*\(",
+        sql,
+        re.IGNORECASE | re.DOTALL
+    ):
+        raise ValueError(
+            "INVALID SQL: window functions (LAG/LEAD/etc) are not allowed in WHERE clause. "
+            "Use subquery or CTE."
+        )
 
     if (
         account_no is not None
