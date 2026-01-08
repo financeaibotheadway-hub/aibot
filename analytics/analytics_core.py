@@ -524,8 +524,19 @@ def execute_cached_query(sql_query: str):
         if now - ts < cache_ttl:
             return df
 
-    job = bq_client.query(sql_query)
-    df = job.result().to_dataframe()
+    job = None
+    try:
+        job = bq_client.query(sql_query)
+        df = job.result().to_dataframe()
+
+    except Exception as e:
+        # 🔴 критично: дістаємо job_id, якщо він вже створився
+        job_id = getattr(job, "job_id", None)
+
+        # прокидаємо далі, але збагачений error
+        raise RuntimeError(
+            f"{str(e)}\nJob ID: {job_id}"
+        ) from e
 
     query_cache[cache_key] = (df.copy(), now)
     return df
