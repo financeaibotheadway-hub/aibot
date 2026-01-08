@@ -451,6 +451,25 @@ def fix_format_date(sql: str) -> str:
         return f"DATE({inside})"
 
     return pattern.sub(_fix, sql)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX EMPTY DATE() CALLS (CRITICAL)
+# ──────────────────────────────────────────────────────────────────────────────
+def fix_empty_date_calls(sql: str) -> str:
+    """
+    Fixes invalid DATE() calls with no arguments:
+    - DATE() ❌
+
+    Strategy:
+    - Replace DATE() → CURRENT_DATE('<LOCAL_TZ>')
+    """
+
+    return re.sub(
+        r"\bDATE\s*\(\s*\)",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql,
+        flags=re.IGNORECASE,
+    )
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
@@ -639,6 +658,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
     sql = fix_window_order_by(sql)
     sql = fix_aggregation_violations(sql)
     sql = fix_format_date(sql)
+    sql = fix_empty_date_calls(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
