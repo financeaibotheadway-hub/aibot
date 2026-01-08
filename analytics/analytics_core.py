@@ -797,30 +797,40 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     matched = find_matches_with_ai(instruction_part, smap)
     for field, value in matched:
         instruction_part += f" ({field}='{value}')"
+
+    sql_query = None
+
     try:
         sql_query = generate_sql(instruction_part, smap)
+    
     except Exception as e:
         tb = traceback.format_exc()
         msg = str(e)
-
+    
+        error_code = None
+        error_reason = None
+    
+        if isinstance(e, BadRequest):
+            error_code = e.code
+            if e.errors:
+                error_reason = e.errors[0].get("reason")
+    
         log_sql_error_to_bq(
             user_id=user_id,
             instruction=instruction_part,
-            sql_query="-- SQL generation failed --",
+            sql_query=sql_query or "",
             error_message=msg,
             traceback_text=tb,
         )
-
-        if RETURN_SQL_ON_ERROR:
-            return (
-            "❌ SQL GENERATION ERROR\n"
-            "```sql\n"
-            f"{locals().get('sql', '-- SQL not generated --')}\n"
-            "```\n"
-            f"{msg}"
+    
+        label = f"[{error_code} / {error_reason}]" if error_code else ""
+    
+        return (
+            f"❌ SQL ERROR {label}\n"
+            f"{msg}\n"
+            f"---\n"
+            f"{sql_query}"
         )
-
-        return f"❌ Помилка генерації SQL:\n{msg}"
 
     try:
         df = execute_cached_query(sql_query)
