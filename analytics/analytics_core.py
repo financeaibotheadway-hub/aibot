@@ -313,9 +313,12 @@ def _sanitize_division_by_zero(sql: str) -> str:
     sql = re.sub(
         r"""
         (?<!SAFE_DIVIDE\()
-        (?P<a>\([^()]+\)|\b[\w\.]+\b)
+        (?<!SUM\()
+        (?<!AVG\()
+        (?<!COUNT\()
+        (?P<a>\b[\w\.]+\b)
         \s*/\s*
-        (?P<b>\([^()]+\)|\b[\w\.]+\b)
+        (?P<b>\b[\w\.]+\b)
         """,
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
@@ -673,7 +676,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     if (
         is_trend_question(instruction_part)
         and not has_explicit_date(instruction_part)
-        and account_no is None
        ):
         return (
             "❗ Для аналізу динаміки потрібен часовий період.\n\n"
