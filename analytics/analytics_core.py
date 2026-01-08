@@ -710,6 +710,11 @@ COST_TABLE    = `{COST_TABLE_REF}`
     # 3. МАТЕМАТИКА
     sql = _sanitize_division_by_zero(sql)
 
+    if re.search(r"\bFORMAT_DATE\s*\(", sql, re.IGNORECASE):
+        raise ValueError(
+            "INVALID SQL: FORMAT_DATE detected after sanitization"
+        )
+        
     if (
         account_no is not None
         and year is not None
@@ -797,8 +802,24 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     matched = find_matches_with_ai(instruction_part, smap)
     for field, value in matched:
         instruction_part += f" ({field}='{value}')"
+    try:
+        sql_query = generate_sql(instruction_part, smap)
+    except Exception as e:
+        tb = traceback.format_exc()
+        msg = str(e)
 
-    sql_query = generate_sql(instruction_part, smap)
+        log_sql_error_to_bq(
+            user_id=user_id,
+            instruction=instruction_part,
+            sql_query="-- SQL generation failed --",
+            error_message=msg,
+            traceback_text=tb,
+        )
+
+        if RETURN_SQL_ON_ERROR:
+            return f"❌ SQL GENERATION ERROR\n{msg}"
+
+        return f"❌ Помилка генерації SQL:\n{msg}"
 
     try:
         df = execute_cached_query(sql_query)
@@ -814,11 +835,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             error_message=msg,
             traceback_text=tb,
         )
-
-        logger.error("SQL execution failed")
-        logger.error("FAILED SQL:\n%s", sql_query)
-        logger.error("ERROR:\n%s", msg)
-        logger.error("TRACEBACK:\n%s", tb)
 
         if RETURN_SQL_ON_ERROR:
             return (
