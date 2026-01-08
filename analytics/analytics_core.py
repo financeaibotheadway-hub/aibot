@@ -35,6 +35,7 @@ BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
 VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
 LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")
+SQL_ERROR_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.sql_error_logs"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -485,6 +486,32 @@ def fix_empty_date_calls(sql: str) -> str:
         sql,
         flags=re.IGNORECASE,
     )
+
+def log_sql_error_to_bq(
+    *,
+    user_id: str,
+    instruction: str,
+    sql_query: str,
+    error_message: str,
+    traceback_text: str,
+):
+    try:
+        row = {
+            "ts": pd.Timestamp.utcnow(),
+            "user_id": user_id,
+            "instruction": instruction,
+            "sql_query": sql_query,
+            "error_message": error_message,
+            "traceback": traceback_text,
+        }
+
+        errors = bq_client.insert_rows_json(SQL_ERROR_TABLE, [row])
+        if errors:
+            logger.error("Failed to insert SQL error log into BQ: %s", errors)
+
+    except Exception:
+        # навіть якщо лог не записався — не ламаємо основний flow
+        logger.exception("CRITICAL: failed to log SQL error to BigQuery")
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
@@ -775,10 +802,33 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
     try:
         df = execute_cached_query(sql_query)
+
     except Exception as e:
+        tb = traceback.format_exc()
         msg = str(e)
+
+        log_sql_error_to_bq(
+            user_id=user_id,
+            instruction=instruction_part,
+            sql_query=sql_query,
+            error_message=msg,
+            traceback_text=tb,
+        )
+
+        logger.error("SQL execution failed")
+        logger.error("FAILED SQL:\n%s", sql_query)
+        logger.error("ERROR:\n%s", msg)
+        logger.error("TRACEBACK:\n%s", tb)
+
         if RETURN_SQL_ON_ERROR:
-            return f"❌ SQL ERROR:\n```sql\n{sql_query}\n```\n{msg}"
+            return (
+                "❌ SQL ERROR\n"
+                "```sql\n"
+                f"{sql_query}\n"
+                "```\n"
+                f"{msg}"
+            )
+
         return f"❌ Помилка при виконанні SQL:\n{msg}"
 
     if df.empty:
