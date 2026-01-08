@@ -361,6 +361,30 @@ def fix_window_order_by(sql: str) -> str:
         return f"{fn} OVER ({inside_fixed})"
 
     return pattern.sub(_add_order_by, sql)
+
+def requires_date_range(text: str) -> bool:
+    keywords = [
+        "збільш", "зменш", "вирос", "впав",
+        "increase", "decrease", "grow", "drop",
+        "динамік", "тренд", "trend",
+        "порівня", "compare",
+        "чи більше", "чи менше",
+        "has increased", "has decreased"
+    ]
+    t = text.lower()
+    return any(k in t for k in keywords)
+
+def has_explicit_date(text: str) -> bool:
+    return bool(re.search(
+        r"\b("
+        r"20\d{2}|"              # year
+        r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+        r"січ|лют|бер|кві|тра|чер|лип|сер|вер|жов|лис|гру|"
+        r"місяц|квартал|рік|"
+        r"from|to|between|до|від"
+        r")\b",
+        text.lower()
+    ))
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
 # ──────────────────────────────────────────────────────────────────────────────
@@ -633,7 +657,17 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     instruction_part = instruction.strip()
     if not instruction_part:
         return "Повідомлення порожнє."
-
+        
+    if requires_date_range(instruction_part) and not has_explicit_date(instruction_part):
+        return (
+            "❗ Для аналізу змін у витратах потрібен часовий період.\n\n"
+            "Будь ласка, уточніть, наприклад:\n"
+            "• за який місяць?\n"
+            "• порівняння яких періодів?\n"
+            "• конкретний діапазон дат (від–до)\n\n"
+            "Без зазначення періоду я не можу зробити коректний висновок."
+        )
+    
     matched = find_matches_with_ai(instruction_part, smap)
     for field, value in matched:
         instruction_part += f" ({field}='{value}')"
