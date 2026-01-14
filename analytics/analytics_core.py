@@ -455,6 +455,8 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
    - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
    - Поверни ТІЛЬКИ SQL код.
+       - Запит ПОВИНЕН бути завершеним. Якщо використовуєш WITH (CTE), обов'язково додай фінальний SELECT * FROM CTE_NAME в кінці.
+       - НЕ обривай запит на середині.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
