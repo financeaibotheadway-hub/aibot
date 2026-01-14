@@ -447,7 +447,23 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
    - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
 
-3. ЗАГАЛЬНІ:
+3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
+   - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
+     `AND column != 'value'` або `AND column NOT IN (...)`.
+   - Мапінг країн (для geo_country): "США/USA" -> 'US', "Україна" -> 'UA', "Британія" -> 'GB'.
+   - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
+
+4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
+   - Якщо в запиті є назва категорії витрат (наприклад "Corporate Events", "Software licenses"), додай фільтр:
+     `WHERE account_name LIKE '%Назва%'` (наприклад `WHERE account_name LIKE '%Corporate Events%'`).
+   - Шукай це в таблиці `{COST_TABLE_REF}`.
+
+5. ТРЕНДИ ТА CTE:
+   - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
+   - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
+   - НЕ обривай запит на середині.
+
+6. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
    - Якщо запит про "revenue/дохід" — таблиця `{REVENUE_TABLE_REF}`. Якщо "cost/витрати" — `{COST_TABLE_REF}`.
    - Для агрегатів завжди давай alias (наприклад `total_revenue`).
@@ -455,22 +471,12 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
    - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
    - Поверни ТІЛЬКИ SQL код.
-       - Запит ПОВИНЕН бути завершеним. Якщо використовуєш WITH (CTE), обов'язково додай фінальний SELECT * FROM CTE_NAME в кінці.
-       - НЕ обривай запит на середині.
-       
-4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
-   - Якщо в запиті є назва категорії витрат (наприклад "Corporate Events", "Software licenses"), додай фільтр:
-     `WHERE account_name LIKE '%Назва%'` (наприклад `WHERE account_name LIKE '%Corporate Events%'`).
-   - Шукай це в таблиці `{COST_TABLE_REF}`.
-   
-5. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ:
-   - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
-     `AND country != 'US'` (або відповідна колонка).
-   - Це критично важливо для точності.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
+    
+    # Очищення SQL
     sql = sql.replace("```sql", "").replace("```", "").strip()
     sql = re.sub(
         r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
@@ -482,6 +488,11 @@ COST: {json.dumps(cost_schema, indent=2)}
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
+    # -------------------------------
+    # HARD ENFORCEMENT LOGIC
+    # -------------------------------
+
+    # 1. Hardcoded date logic for specific simple queries
     if (
         account_no is not None
         and year is not None
@@ -506,19 +517,24 @@ COST: {json.dumps(cost_schema, indent=2)}
           AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'
         """.strip()
 
-    # HARD ENFORCEMENT
+    # 2. Prevent wrong table usage
     if account_no is not None:
         if REVENUE_TABLE_REF in sql:
             raise ValueError("INVALID SQL: revenue table used for account-based cost query")
     
+    # 3. Remove GROUP BY if not needed
     if re.search(r"\b(скільки|sum|total)\b", instruction_part.lower()):
-        if re.search(r"\bGROUP\s+BY\b", sql, re.IGNORECASE):
-            sql = re.sub(r"\bGROUP\s+BY\b.+?$", "", sql, flags=re.IGNORECASE | re.DOTALL)
+        # Перевіряємо, чи не просили групування в тексті
+        if not _needs_breakdown(instruction_part):
+            if re.search(r"\bGROUP\s+BY\b", sql, re.IGNORECASE):
+                sql = re.sub(r"\bGROUP\s+BY\b.+?$", "", sql, flags=re.IGNORECASE | re.DOTALL)
     
+    # 4. Cost vs Revenue table check
     if metric in {"cost", "opex", "expense", "expenses"}:
         if REVENUE_TABLE_REF in sql:
             raise ValueError("INVALID SQL: revenue table used for cost metric")
 
+    # 5. Apply Hard Filters
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
@@ -529,9 +545,6 @@ COST: {json.dumps(cost_schema, indent=2)}
 
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
-
-    if account_no is not None and not _needs_breakdown(instruction_part):
-        sql = re.sub(r"\bGROUP\s+BY\b.+?$", "", sql, flags=re.IGNORECASE | re.DOTALL)
 
     return sql
 
