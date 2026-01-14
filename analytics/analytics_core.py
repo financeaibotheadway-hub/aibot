@@ -457,6 +457,11 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Поверни ТІЛЬКИ SQL код.
        - Запит ПОВИНЕН бути завершеним. Якщо використовуєш WITH (CTE), обов'язково додай фінальний SELECT * FROM CTE_NAME в кінці.
        - НЕ обривай запит на середині.
+       
+4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
+   - Якщо в запиті є назва категорії витрат (наприклад "Corporate Events", "Software licenses"), додай фільтр:
+     `WHERE account_name LIKE '%Назва%'` (наприклад `WHERE account_name LIKE '%Corporate Events%'`).
+   - Шукай це в таблиці `{COST_TABLE_REF}`.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
