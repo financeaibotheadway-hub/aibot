@@ -36,6 +36,7 @@ BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
 VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
 LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")
+BQ_LOG_TABLE     = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -552,6 +553,12 @@ COST: {json.dumps(cost_schema, indent=2)}
 
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
+
+    cleaned_start = sql.strip().upper()
+    if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
+        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу,
+        # замість того, щоб мучити BigQuery.
+        raise ValueError(f"🤖 Відповідь AI (не SQL):\n\n{sql}")
 
     return sql
 
