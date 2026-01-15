@@ -162,31 +162,25 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# --- FIX: SMART WHERE INJECTION (Handles JOINs correctly) ---
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
-    # 1. Якщо умова вже є - ігноруємо
-    if condition_sql.lower() in sql.lower():
+    sql_lower = sql.lower()
+    if condition_sql.lower() in sql_lower:
         return sql
-
-    # 2. Якщо вже є WHERE, додаємо AND перед ним
-    # (Regex знаходить 'WHERE' і замінює на 'WHERE condition AND ...')
-    if re.search(r"\bwhere\b", sql, re.IGNORECASE):
-         return re.sub(r"(\bwhere\b)", f"WHERE {condition_sql} AND ", sql, count=1, flags=re.IGNORECASE)
-
-    # 3. Якщо WHERE немає, вставляємо його у правильне місце.
-    # SQL структура: SELECT ... FROM ... [JOIN ...] [WHERE] [GROUP BY] [ORDER BY] ...
-    # Шукаємо ключові слова, які йдуть ПІСЛЯ WHERE
-    keywords_pattern = r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|WINDOW)\b"
-    match = re.search(keywords_pattern, sql, re.IGNORECASE)
-
-    if match:
-        # Вставляємо перед знайденим ключовим словом
-        start_idx = match.start()
-        return sql[:start_idx] + f" WHERE {condition_sql} " + sql[start_idx:]
-    else:
-        # Якщо ключових слів немає, просто додаємо в кінець (після FROM/JOIN)
-        clean_sql = sql.strip().rstrip(';')
-        return f"{clean_sql} WHERE {condition_sql}"
+    if " where " in f" {sql_lower} ":
+        return re.sub(
+            r"\bwhere\b",
+            f"WHERE {condition_sql} AND",
+            sql,
+            flags=re.IGNORECASE,
+            count=1,
+        )
+    return re.sub(
+        r"(\bfrom\b\s+`?[\w\-\.:]+`?)",
+        r"\1 WHERE " + condition_sql,
+        sql,
+        flags=re.IGNORECASE,
+        count=1,
+    )
 
 # >>> preload schemas
 _ = get_all_schemas()
@@ -506,7 +500,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
 Стовпці REVENUE: {rev_cols}
 Стовпці COST: {cost_cols}
 
-Схеми таблиць (JSON) — ЦЕ ЄДИНЕ ДЖЕРЕЛО ПРАВДИ ПРО КОЛОНКИ:
+Схеми таблиць (JSON):
 REVENUE: {json.dumps(rev_schema, indent=2)}
 COST: {json.dumps(cost_schema, indent=2)}
 
@@ -537,9 +531,6 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
    - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
    - НЕ обривай запит на середині.
-   - НЕ намагайся робити JOIN по `center_code`, `department_id` чи іншим ID, якщо їх немає в ОБИДВОХ схемах.
-   - Замість цього, агрегуй обидві таблиці ПО МІСЯЦЯХ (CTE_REV та CTE_COST), а потім з'єднай їх через місяць.
-   - Порівнюй динаміку сум.
 
 6. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
@@ -549,17 +540,8 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
    - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
    - Поверни ТІЛЬКИ SQL код.
-   - ВИКОРИСТОВУЙ ТІЛЬКИ СТОВПЦІ З JSON СХЕМ ВИЩЕ.
-   - ЗАБОРОНЕНО вигадувати колонки (наприклад `costrev_center_code`, `profit_center`, `link_id`). Якщо колонки немає в JSON — її не існує.
-   - Якщо не можеш зв'язати таблиці — пиши запит лише до однієї з них або повідом про помилку (через SELECT 'Error...').
-
-7. META-ПИТАННЯ (Що неможливо?):
-   - Якщо питають "які метрики неможливо порахувати", "чого немає в даних", "які обмеження":
-   - Поверни простий SQL: `SELECT 'Тут напиши текст пояснення, чого не вистачає...' AS info`.
-   - ⚠️ ВАЖЛИВО: Текст має бути В ОДНОМУ РЯДКУ (single line string). Не розбивай його на кілька рядків, це ламає SQL.
-   - Приклад: `SELECT 'Неможливо порахувати LTV, бо немає ID користувача' AS info`
    
-8. СПЕЦИФІЧНІ ТЕРМІНИ:
+7. СПЕЦИФІЧНІ ТЕРМІНИ:
    - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
    - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
 """
@@ -579,7 +561,8 @@ COST: {json.dumps(cost_schema, indent=2)}
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
-    # --- FIX: Concatenated String Literals ---
+    # --- NEW FIX: Concatenated String Literals ---
+    # Якщо модель розбила текстовий рядок ('text' \n 'text'), склеюємо їх
     sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
     sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
 
@@ -690,7 +673,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            # --- ФУНКЦІЇ РЕНДЕРУ (ТВОЇ ОРИГІНАЛЬНІ) ---
+            # --- ТВОЇ ФУНКЦІЇ РЕНДЕРУ (БЕЗ ЗМІН) ---
             def render_table(df: pd.DataFrame, limit: int = 10) -> str:
                 df = df.copy()
                 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
@@ -768,6 +751,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             final_response = error_details.replace("ValueError: ", "")
             status = "SUCCESS" 
         else:
+            # === ТВОЯ ОБРОБКА ПОМИЛОК ===
             if RETURN_SQL_ON_ERROR and generated_sql:
                 final_response = f"❌ SQL ERROR:\n```sql\n{generated_sql}\n```\n{error_details}"
             else:
@@ -775,6 +759,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
     finally:
         # === ЛОГУВАННЯ В BIGQUERY ===
+        # Виконується завжди, навіть якщо return спрацював раніше
         end_time = time.time()
         duration = end_time - start_time
         
@@ -806,3 +791,6 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
+
+
+
