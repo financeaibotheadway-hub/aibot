@@ -448,6 +448,8 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Використовуй поле дати (наприклад `order_date`, `date`, `created_at` — яке є в схемі).
    - Для "останні X місяців" використовуй: `WHERE date_column >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL X MONTH)`.
    - Не використовуй `BETWEEN` зі статичними датами, якщо просять відносний період ("останні...").
+   - Якщо користувач вказав період (наприклад "минулого місяця"), використовуй `WHERE date_column ...`.
+   - ⚠️ ВАЖЛИВО: Якщо користувач НЕ вказав конкретну дату чи період, НЕ додавай умову `WHERE date ...`. Аналізуй дані за весь доступний час.
 
 2. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
    - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
@@ -478,6 +480,10 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
    - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
    - Поверни ТІЛЬКИ SQL код.
+   
+7. СПЕЦИФІЧНІ ТЕРМІНИ:
+   - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
+   - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
