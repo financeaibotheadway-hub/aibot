@@ -500,7 +500,7 @@ COST_TABLE    = `{COST_TABLE_REF}`
 Стовпці REVENUE: {rev_cols}
 Стовпці COST: {cost_cols}
 
-Схеми таблиць (JSON) — ЦЕ ЄДИНЕ ДЖЕРЕЛО ПРАВДИ ПРО КОЛОНКИ:
+Схеми таблиць (JSON):
 REVENUE: {json.dumps(rev_schema, indent=2)}
 COST: {json.dumps(cost_schema, indent=2)}
 
@@ -531,9 +531,6 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
    - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
    - НЕ обривай запит на середині.
-   - НЕ намагайся робити JOIN по `center_code`, `department_id` чи іншим ID, якщо їх немає в ОБИДВОХ схемах.
-   - Замість цього, агрегуй обидві таблиці ПО МІСЯЦЯХ (CTE_REV та CTE_COST), а потім з'єднай їх через місяць.
-   - Порівнюй динаміку сум.
 
 6. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
@@ -543,17 +540,8 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
    - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
    - Поверни ТІЛЬКИ SQL код.
-   - ВИКОРИСТОВУЙ ТІЛЬКИ СТОВПЦІ З JSON СХЕМ ВИЩЕ.
-   - ЗАБОРОНЕНО вигадувати колонки (наприклад `costrev_center_code`, `profit_center`, `link_id`). Якщо колонки немає в JSON — її не існує.
-   - Якщо не можеш зв'язати таблиці — пиши запит лише до однієї з них або повідом про помилку (через SELECT 'Error...').
-
-7. META-ПИТАННЯ (Що неможливо?):
-   - Якщо питають "які метрики неможливо порахувати", "чого немає в даних", "які обмеження":
-   - Поверни простий SQL: `SELECT 'Тут напиши текст пояснення, чого не вистачає...' AS info`.
-   - ⚠️ ВАЖЛИВО: Текст має бути В ОДНОМУ РЯДКУ (single line string). Не розбивай його на кілька рядків, це ламає SQL.
-   - Приклад: `SELECT 'Неможливо порахувати LTV, бо немає ID користувача' AS info`
    
-8. СПЕЦИФІЧНІ ТЕРМІНИ:
+7. СПЕЦИФІЧНІ ТЕРМІНИ:
    - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
    - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
 """
@@ -573,6 +561,8 @@ COST: {json.dumps(cost_schema, indent=2)}
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
+    # --- NEW FIX: Concatenated String Literals ---
+    # Якщо модель розбила текстовий рядок ('text' \n 'text'), склеюємо їх
     sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
     sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
 
@@ -631,8 +621,8 @@ COST: {json.dumps(cost_schema, indent=2)}
     # ПЕРЕВІРКА: Чи це взагалі SQL? (щоб уникнути помилки \320)
     cleaned_start = sql.strip().upper()
     if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
-        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу
-        # Цю помилку перехопить блок try/except у execute_single_query
+        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу,
+        # замість того, щоб мучити BigQuery.
         raise ValueError(f"🤖 Відповідь AI (не SQL):\n\n{sql}")
 
     return sql
@@ -683,7 +673,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            # --- ФУНКЦІЇ РЕНДЕРУ (ТВОЇ ОРИГІНАЛЬНІ) ---
+            # --- ТВОЇ ФУНКЦІЇ РЕНДЕРУ (БЕЗ ЗМІН) ---
             def render_table(df: pd.DataFrame, limit: int = 10) -> str:
                 df = df.copy()
                 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
@@ -761,6 +751,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             final_response = error_details.replace("ValueError: ", "")
             status = "SUCCESS" 
         else:
+            # === ТВОЯ ОБРОБКА ПОМИЛОК ===
             if RETURN_SQL_ON_ERROR and generated_sql:
                 final_response = f"❌ SQL ERROR:\n```sql\n{generated_sql}\n```\n{error_details}"
             else:
@@ -768,6 +759,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
     finally:
         # === ЛОГУВАННЯ В BIGQUERY ===
+        # Виконується завжди, навіть якщо return спрацював раніше
         end_time = time.time()
         duration = end_time - start_time
         
