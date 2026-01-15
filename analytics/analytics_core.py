@@ -96,7 +96,14 @@ def _needs_breakdown(text: str) -> bool:
     keywords = [
         "розбив", "breakdown",
         "по центрах", "по категоріях",
-        "by center", "by category"
+        "by center", "by category",
+        # --- ДОДАНО НОВІ КЛЮЧОВІ СЛОВА ---
+        "кожн", "each", "per ",      # "у кожної", "for each"
+        "по ", "by ",                # "по юрсобах", "by entity"
+        "структур", "structure",     # "структура витрат"
+        "розподіл", "distribution",  # "розподіл витрат"
+        "динамік", "trend",          # динаміка завжди вимагає групування по часу
+        "legal_entity", "юрсоб"      # специфічні поля, які часто групують
     ]
     t = text.lower()
     return any(k in t for k in keywords)
@@ -522,19 +529,13 @@ COST: {json.dumps(cost_schema, indent=2)}
         if REVENUE_TABLE_REF in sql:
             raise ValueError("INVALID SQL: revenue table used for account-based cost query")
     
-    # 3. Remove GROUP BY if not needed
-    if re.search(r"\b(скільки|sum|total)\b", instruction_part.lower()):
-        # Перевіряємо, чи не просили групування в тексті
-        if not _needs_breakdown(instruction_part):
-            if re.search(r"\bGROUP\s+BY\b", sql, re.IGNORECASE):
-                sql = re.sub(r"\bGROUP\s+BY\b.+?$", "", sql, flags=re.IGNORECASE | re.DOTALL)
     
-    # 4. Cost vs Revenue table check
+    # 3. Cost vs Revenue table check
     if metric in {"cost", "opex", "expense", "expenses"}:
         if REVENUE_TABLE_REF in sql:
             raise ValueError("INVALID SQL: revenue table used for cost metric")
 
-    # 5. Apply Hard Filters
+    # 4. Apply Hard Filters
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
