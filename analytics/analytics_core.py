@@ -563,121 +563,152 @@ COST: {json.dumps(cost_schema, indent=2)}
     return sql
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EXECUTE SINGLE QUERY
+# EXECUTE SINGLE QUERY (INTEGRATED FIX & LOGGING)
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown") -> str:
+    start_time = time.time()
     instruction_part = instruction.strip()
-    if not instruction_part:
-        return "Повідомлення порожнє."
-        
-    if (
-        is_trend_question(instruction_part)
-        and not has_explicit_date(instruction_part)
-       ):
-        return (
-            "❗ Для аналізу динаміки потрібен часовий період.\n\n"
-            "Будь ласка, уточніть, наприклад:\n"
-            "• за який місяць?\n"
-            "• порівняння яких періодів?\n"
-            "• конкретний діапазон дат (від–до)"
-        )
     
-    matched = find_matches_with_ai(instruction_part, smap)
-    for field, value in matched:
-        instruction_part += f" ({field}='{value}')"
-
-    sql_query = generate_sql(instruction_part, smap)
+    # Змінні для логування
+    generated_sql = None
+    status = "SUCCESS"
+    error_details = None
+    final_response = ""
 
     try:
-        df = execute_cached_query(sql_query)
-    except Exception as e:
-        msg = str(e)
-        if RETURN_SQL_ON_ERROR:
-            return f"❌ SQL ERROR:\n```sql\n{sql_query}\n```\n{msg}"
-        return f"❌ Помилка при виконанні SQL:\n{msg}"
-
-    if df.empty:
-        return "Результат порожній."
-
-    if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
-        df = df.rename(columns={df.columns[0]: "value"})
-
-    def render_table(df: pd.DataFrame, limit: int = 10) -> str:
-        df = df.copy()
-        num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-        if num_cols:
-            df = df.sort_values(by=num_cols[0], ascending=False)
-        df = df.head(limit)
-        for col in num_cols:
-            df[col] = df[col].round(2).map(
-                lambda x: f"{x:,.2f}".replace(",", " ")
-                if pd.notnull(x) else ""
+        # --- ТВОЯ ЛОГІКА ПЕРЕВІРОК (зберігаємо, але записуємо у final_response) ---
+        if not instruction_part:
+            final_response = "Повідомлення порожнє."
+            return final_response
+            
+        if (is_trend_question(instruction_part) and not has_explicit_date(instruction_part)):
+            final_response = (
+                "❗ Для аналізу динаміки потрібен часовий період.\n\n"
+                "Будь ласка, уточніть, наприклад:\n"
+                "• за який місяць?\n"
+                "• порівняння яких періодів?\n"
+                "• конкретний діапазон дат (від–до)"
             )
-        df = df.astype(str)
-        col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
-        header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
-        separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
-        rows = []
-        for _, row in df.iterrows():
-            rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |")
-        return "\n".join([header, separator] + rows)
-
-    def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
-        df = df.copy()
-        num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-        if not num_cols:
-            return ""
-        val_col = num_cols[0]
-        label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
-        label_col = label_cols[0] if label_cols else df.columns[0]
-        df = df.sort_values(by=val_col, ascending=False).head(limit)
-        values = df[val_col].fillna(0).tolist()
-        labels = df[label_col].astype(str).tolist()
-        max_len = 30
-        max_val = max(values) if max(values) > 0 else 1
-        lines = ["📊 *TOP-10 графік*"]
-        for label, val in zip(labels, values):
-            bar_len = int((val / max_val) * max_len)
-            bar = "█" * bar_len
-            val_fmt = f"{val:,.2f}".replace(",", " ")
-            lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
-        return "\n".join(lines)
-
-    table_md = render_table(df)
-    ascii_md = render_ascii_chart(df)
-    final_display = f"```\n{table_md}\n```\n{ascii_md}"
-
-    analysis_prompt = f"""
-
-        Ти — фінансовий аналітик. Твоє завдання — пояснити дані користувачу.
+            return final_response
         
-        Дані (CSV):
-        {df.to_csv(index=False)}
-        
-        Запит користувача:
-        "{instruction_part}"
-        
-        ПРАВИЛА АНАЛІЗУ:
-        1. Якщо в таблиці 1 рядок і 1 колонка (назва), це і є пряма відповідь (наприклад, "Найгірший застосунок: Impulse").
-        2. Якщо є цифри, назви їх.
-        3. Не пиши "дані відсутні", якщо в таблиці є хоч щось.
-        4. Не аналізуй структуру таблиці ("стовпець ідентифікує..."), просто дай відповідь.
-        
-        Зроби висновок українською мовою (1-2 речення).
-    """
-    resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
-    return final_display + "\n\n" + resp.text.strip()
+        # --- ТВОЯ ЛОГІКА SEMANTIC MAP ---
+        matched = find_matches_with_ai(instruction_part, smap)
+        augmented_instruction = instruction_part
+        for field, value in matched:
+            augmented_instruction += f" ({field}='{value}')"
 
-def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
-    queries = split_into_separate_queries(message)
-    if len(queries) == 1:
-        return execute_single_query(queries[0], smap, user_id)
-    out = f"📝 Знайдено {len(queries)} запитів:\n\n"
-    for i, q in enumerate(queries, 1):
-        ans = execute_single_query(q, smap, user_id)
-        out += f"**Запит {i}:** {q}\n{ans}\n\n"
-    return out
+        # --- ГЕНЕРАЦІЯ SQL (ТЕПЕР ВСЕРЕДИНІ TRY) ---
+        # Це виправить помилку: якщо прийде текст замість SQL, ми спіймаємо ValueError нижче
+        generated_sql = generate_sql(augmented_instruction, smap)
 
-def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
-    smap = semantic_map_override or semantic_map
-    return process_slack_message(message, smap, user_id)
+        # --- ВИКОНАННЯ ЗАПИТУ ---
+        df = execute_cached_query(generated_sql)
+
+        if df.empty:
+            final_response = "Результат порожній."
+        else:
+            if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
+                df = df.rename(columns={df.columns[0]: "value"})
+
+            # --- ТВОЇ ФУНКЦІЇ РЕНДЕРУ (БЕЗ ЗМІН) ---
+            def render_table(df: pd.DataFrame, limit: int = 10) -> str:
+                df = df.copy()
+                num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                if num_cols:
+                    df = df.sort_values(by=num_cols[0], ascending=False)
+                df = df.head(limit)
+                for col in num_cols:
+                    df[col] = df[col].round(2).map(
+                        lambda x: f"{x:,.2f}".replace(",", " ")
+                        if pd.notnull(x) else ""
+                    )
+                df = df.astype(str)
+                col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
+                header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
+                separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |")
+                return "\n".join([header, separator] + rows)
+
+            def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
+                df = df.copy()
+                num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                if not num_cols:
+                    return ""
+                val_col = num_cols[0]
+                label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
+                label_col = label_cols[0] if label_cols else df.columns[0]
+                df = df.sort_values(by=val_col, ascending=False).head(limit)
+                values = df[val_col].fillna(0).tolist()
+                labels = df[label_col].astype(str).tolist()
+                max_len = 30
+                max_val = max(values) if max(values) > 0 else 1
+                lines = ["📊 *TOP-10 графік*"]
+                for label, val in zip(labels, values):
+                    bar_len = int((val / max_val) * max_len)
+                    bar = "█" * bar_len
+                    val_fmt = f"{val:,.2f}".replace(",", " ")
+                    lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
+                return "\n".join(lines)
+
+            table_md = render_table(df)
+            ascii_md = render_ascii_chart(df)
+            final_display = f"```\n{table_md}\n```\n{ascii_md}"
+
+            # --- ТВІЙ ПРОМПТ АНАЛІЗУ (БЕЗ ЗМІН) ---
+            analysis_prompt = f"""
+
+                Ти — фінансовий аналітик. Твоє завдання — пояснити дані користувачу.
+                
+                Дані (CSV):
+                {df.to_csv(index=False)}
+                
+                Запит користувача:
+                "{instruction_part}"
+                
+                ПРАВИЛА АНАЛІЗУ:
+                1. Якщо в таблиці 1 рядок і 1 колонка (назва), це і є пряма відповідь (наприклад, "Найгірший застосунок: Impulse").
+                2. Якщо є цифри, назви їх.
+                3. Не пиши "дані відсутні", якщо в таблиці є хоч щось.
+                4. Не аналізуй структуру таблиці ("стовпець ідентифікує..."), просто дай відповідь.
+                
+                Зроби висновок українською мовою (1-2 речення).
+            """
+            resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
+            final_response = final_display + "\n\n" + resp.text.strip()
+
+    except Exception as e:
+        status = "ERROR"
+        error_details = str(e)
+
+        # === ФІКС ДЛЯ ТЕКСТОВОЇ ВІДПОВІДІ AI ===
+        if "🤖 Відповідь AI" in error_details:
+            # Це не справжня помилка, а текст від AI, тому просто показуємо його
+            final_response = error_details.replace("ValueError: ", "")
+            # Можна вважати це успіхом, бо бот відповів
+            status = "SUCCESS" 
+        else:
+            # === ТВОЯ ОБРОБКА ПОМИЛОК ===
+            if RETURN_SQL_ON_ERROR and generated_sql:
+                final_response = f"❌ SQL ERROR:\n```sql\n{generated_sql}\n```\n{error_details}"
+            else:
+                final_response = f"❌ Помилка при виконанні SQL:\n{error_details}"
+
+    finally:
+        # === ЛОГУВАННЯ В BIGQUERY ===
+        # Виконується завжди, навіть якщо return спрацював раніше
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        log_interaction(
+            user_id=user_id,
+            prompt=instruction_part,
+            sql=generated_sql,
+            response=final_response,
+            duration=duration,
+            status=status,
+            error_msg=error_details
+        )
+
+    return final_response
