@@ -13,7 +13,7 @@ from datetime import datetime
 
 import pandas as pd
 from google.cloud import bigquery
-from google.api_core.exceptions import BadRequest, GoogleAPIError
+from google.api_core.exceptions import BadRequest, GoogleAPIError, NotFound
 
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
@@ -28,7 +28,7 @@ from analytics.trend_analysis import run_trend_analysis
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ENV / LOGGING
+# ENV / LOGGING SETUP
 # ──────────────────────────────────────────────────────────────────────────────
 BQ_PROJECT       = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
 BQ_DATASET       = os.getenv("BQ_DATASET", "uploads")
@@ -36,6 +36,8 @@ BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
 VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
 LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")
+
+# Ім'я таблиці для логів
 BQ_LOG_TABLE     = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -48,6 +50,35 @@ REVENUE_METRICS = {
     "revenue", "gmv", "gross_revenue",
     "gross_usd", "total_revenue"
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INIT CLIENTS
+# ──────────────────────────────────────────────────────────────────────────────
+REVENUE_TABLE_REF = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_REVENUE_TABLE}"
+COST_TABLE_REF    = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_COST_TABLE}"
+
+bq_client = bigquery.Client(project=BQ_PROJECT)
+
+try:
+    vertexai.init(project=BQ_PROJECT, location=VERTEX_LOCATION)
+except Exception:
+    logger.warning("Vertex init failed", exc_info=True)
+
+model = GenerativeModel("gemini-2.5-flash")
+
+query_cache = {}
+cache_ttl = 300
+
+_schema_cache = {}
+_schema_time  = {}
+
+# Флаг, щоб перевіряти наявність таблиці логів лише 1 раз за запуск
+_log_table_checked = False 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def extract_account_no(text: str) -> int | None:
     m = re.search(
@@ -98,42 +129,18 @@ def _needs_breakdown(text: str) -> bool:
         "розбив", "breakdown",
         "по центрах", "по категоріях",
         "by center", "by category",
-        # --- ДОДАНО НОВІ КЛЮЧОВІ СЛОВА ---
-        "кожн", "each", "per ",      # "у кожної", "for each"
-        "по ", "by ",                # "по юрсобах", "by entity"
-        "структур", "structure",     # "структура витрат"
-        "розподіл", "distribution",  # "розподіл витрат"
-        "динамік", "trend",          # динаміка завжди вимагає групування по часу
-        "legal_entity", "юрсоб"      # специфічні поля, які часто групують
+        "кожн", "each", "per ",      
+        "по ", "by ",                
+        "структур", "structure",     
+        "розподіл", "distribution",  
+        "динамік", "trend",          
+        "legal_entity", "юрсоб"      
     ]
     t = text.lower()
     return any(k in t for k in keywords)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# INIT CLIENTS
-# ──────────────────────────────────────────────────────────────────────────────
-REVENUE_TABLE_REF = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_REVENUE_TABLE}"
-COST_TABLE_REF    = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_COST_TABLE}"
-
-bq_client = bigquery.Client(project=BQ_PROJECT)
-
-try:
-    vertexai.init(project=BQ_PROJECT, location=VERTEX_LOCATION)
-except Exception:
-    logger.warning("Vertex init failed", exc_info=True)
-
-model = GenerativeModel("gemini-2.5-flash")
-
-query_cache = {}
-cache_ttl = 300
-
-_schema_cache = {}
-_schema_time  = {}
-
-
 def get_cache_key(query: str) -> str:
     return hashlib.md5(query.encode("utf-8")).hexdigest()
-
 
 def get_table_schema(table_ref: str, ttl_sec: int = 3600):
     now = time.time()
@@ -142,7 +149,6 @@ def get_table_schema(table_ref: str, ttl_sec: int = 3600):
         _schema_cache[table_ref] = [{"name": c.name, "type": c.field_type} for c in schema]
         _schema_time[table_ref] = now
     return _schema_cache[table_ref]
-
 
 def get_all_schemas():
     rev_schema = get_table_schema(REVENUE_TABLE_REF)
@@ -176,8 +182,63 @@ def _ensure_where_filter(sql: str, condition_sql: str) -> str:
         count=1,
     )
 
-# >>> preload
+# >>> preload schemas
 _ = get_all_schemas()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BIGQUERY LOGGING LOGIC
+# ──────────────────────────────────────────────────────────────────────────────
+def _ensure_log_table_exists():
+    """Створює таблицю логів, якщо її не існує"""
+    global _log_table_checked
+    if _log_table_checked:
+        return
+
+    try:
+        bq_client.get_table(BQ_LOG_TABLE)
+        _log_table_checked = True
+    except NotFound:
+        logger.info(f"Table {BQ_LOG_TABLE} not found. Creating...")
+        schema = [
+            bigquery.SchemaField("event_timestamp", "TIMESTAMP"),
+            bigquery.SchemaField("user_id", "STRING"),
+            bigquery.SchemaField("prompt", "STRING"),
+            bigquery.SchemaField("sql_query", "STRING"),
+            bigquery.SchemaField("response_text", "STRING"),
+            bigquery.SchemaField("duration_sec", "FLOAT64"),
+            bigquery.SchemaField("status", "STRING"),
+            bigquery.SchemaField("error_message", "STRING"),
+        ]
+        table = bigquery.Table(BQ_LOG_TABLE, schema=schema)
+        try:
+            bq_client.create_table(table)
+            logger.info(f"Table {BQ_LOG_TABLE} created successfully.")
+            _log_table_checked = True
+        except Exception as e:
+            logger.error(f"Failed to create log table: {e}")
+
+def log_interaction(user_id, prompt, sql, response, duration, status, error_msg=None):
+    """Записує лог в BigQuery"""
+    _ensure_log_table_exists()
+
+    try:
+        rows = [{
+            "event_timestamp": datetime.now().isoformat(),
+            "user_id": str(user_id),
+            "prompt": str(prompt),
+            "sql_query": str(sql) if sql else None,
+            "response_text": str(response)[:10000] if response else None,
+            "duration_sec": float(duration),
+            "status": status,
+            "error_message": str(error_msg) if error_msg else None
+        }]
+        
+        errors = bq_client.insert_rows_json(BQ_LOG_TABLE, rows)
+        if errors:
+            logger.error(f"BQ Logging errors: {errors}")
+    except Exception as e:
+        logger.error(f"Failed to write log to BQ: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -189,7 +250,6 @@ def _collect_date_columns(schema_list):
         for f in schema_list
         if f.get("type") in ("DATE", "DATETIME", "TIMESTAMP")
     }
-
 
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
     sql_query = re.sub(
@@ -345,7 +405,7 @@ def find_matches_with_ai(instruction, smap):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SPLIT (UPDATED)
+# SPLIT
 # ──────────────────────────────────────────────────────────────────────────────
 def _has_filter_only_tail(text: str) -> bool:
     t = text.lower()
@@ -405,7 +465,7 @@ def split_into_separate_queries(message: str) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SQL GENERATOR + METRIC PARSER INTEGRATION (UPDATED)
+# SQL GENERATOR
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_sql(instruction_part: str, smap) -> str:
     today_str = datetime.now().strftime('%Y-%m-%d')   
@@ -449,7 +509,6 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Використовуй поле дати (наприклад `order_date`, `date`, `created_at` — яке є в схемі).
    - Для "останні X місяців" використовуй: `WHERE date_column >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL X MONTH)`.
    - Не використовуй `BETWEEN` зі статичними датами, якщо просять відносний період ("останні...").
-   - Якщо користувач вказав період (наприклад "минулого місяця"), використовуй `WHERE date_column ...`.
    - ⚠️ ВАЖЛИВО: Якщо користувач НЕ вказав конкретну дату чи період, НЕ додавай умову `WHERE date ...`. Аналізуй дані за весь доступний час.
 
 2. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
@@ -554,10 +613,11 @@ COST: {json.dumps(cost_schema, indent=2)}
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
 
+    # ПЕРЕВІРКА: Чи це взагалі SQL? (щоб уникнути помилки \320)
     cleaned_start = sql.strip().upper()
     if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
-        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу,
-        # замість того, щоб мучити BigQuery.
+        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу
+        # Цю помилку перехопить блок try/except у execute_single_query
         raise ValueError(f"🤖 Відповідь AI (не SQL):\n\n{sql}")
 
     return sql
@@ -576,7 +636,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     final_response = ""
 
     try:
-        # --- ТВОЯ ЛОГІКА ПЕРЕВІРОК (зберігаємо, але записуємо у final_response) ---
         if not instruction_part:
             final_response = "Повідомлення порожнє."
             return final_response
@@ -591,17 +650,16 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             )
             return final_response
         
-        # --- ТВОЯ ЛОГІКА SEMANTIC MAP ---
         matched = find_matches_with_ai(instruction_part, smap)
         augmented_instruction = instruction_part
         for field, value in matched:
             augmented_instruction += f" ({field}='{value}')"
 
-        # --- ГЕНЕРАЦІЯ SQL (ТЕПЕР ВСЕРЕДИНІ TRY) ---
+        # === ГЕНЕРАЦІЯ SQL (ВСЕРЕДИНІ TRY) ===
         # Це виправить помилку: якщо прийде текст замість SQL, ми спіймаємо ValueError нижче
         generated_sql = generate_sql(augmented_instruction, smap)
 
-        # --- ВИКОНАННЯ ЗАПИТУ ---
+        # === ВИКОНАННЯ ЗАПИТУ ===
         df = execute_cached_query(generated_sql)
 
         if df.empty:
@@ -610,7 +668,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            # --- ТВОЇ ФУНКЦІЇ РЕНДЕРУ (БЕЗ ЗМІН) ---
+            # --- ФУНКЦІЇ РЕНДЕРУ (ТВОЇ ОРИГІНАЛЬНІ) ---
             def render_table(df: pd.DataFrame, limit: int = 10) -> str:
                 df = df.copy()
                 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
@@ -656,7 +714,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             ascii_md = render_ascii_chart(df)
             final_display = f"```\n{table_md}\n```\n{ascii_md}"
 
-            # --- ТВІЙ ПРОМПТ АНАЛІЗУ (БЕЗ ЗМІН) ---
+            # --- ПРОМПТ АНАЛІЗУ (ТВІЙ ОРИГІНАЛЬНИЙ) ---
             analysis_prompt = f"""
 
                 Ти — фінансовий аналітик. Твоє завдання — пояснити дані користувачу.
@@ -686,10 +744,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         if "🤖 Відповідь AI" in error_details:
             # Це не справжня помилка, а текст від AI, тому просто показуємо його
             final_response = error_details.replace("ValueError: ", "")
-            # Можна вважати це успіхом, бо бот відповів
             status = "SUCCESS" 
         else:
-            # === ТВОЯ ОБРОБКА ПОМИЛОК ===
             if RETURN_SQL_ON_ERROR and generated_sql:
                 final_response = f"❌ SQL ERROR:\n```sql\n{generated_sql}\n```\n{error_details}"
             else:
@@ -697,7 +753,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
     finally:
         # === ЛОГУВАННЯ В BIGQUERY ===
-        # Виконується завжди, навіть якщо return спрацював раніше
         end_time = time.time()
         duration = end_time - start_time
         
@@ -712,3 +767,20 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         )
 
     return final_response
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINTS
+# ──────────────────────────────────────────────────────────────────────────────
+def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
+    queries = split_into_separate_queries(message)
+    if len(queries) == 1:
+        return execute_single_query(queries[0], smap, user_id)
+    out = f"📝 Знайдено {len(queries)} запитів:\n\n"
+    for i, q in enumerate(queries, 1):
+        ans = execute_single_query(q, smap, user_id)
+        out += f"**Запит {i}:** {q}\n{ans}\n\n"
+    return out
+
+def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
+    smap = semantic_map_override or semantic_map
+    return process_slack_message(message, smap, user_id)
