@@ -573,6 +573,9 @@ COST: {json.dumps(cost_schema, indent=2)}
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
+    sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
+    sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
+
     # -------------------------------
     # HARD ENFORCEMENT LOGIC
     # -------------------------------
