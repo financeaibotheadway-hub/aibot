@@ -549,7 +549,7 @@ COST: {json.dumps(cost_schema, indent=2)}
         date_col = next((c for c in preferred if _schema_has_column(cost_schema, c)), None)
         if not date_col: raise ValueError("No date column found in COST table")
     
-        return f"SELECT SUM(ABS(amount_lcy)) AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
+        return f"SELECT SUM(amount_lcy) * -1 AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
 
     if account_no is not None and REVENUE_TABLE_REF in sql:
         raise ValueError("INVALID SQL: revenue table used for account-based cost query")
