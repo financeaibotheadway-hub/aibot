@@ -30,14 +30,14 @@ from analytics.trend_analysis import run_trend_analysis
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV / LOGGING SETUP
 # ──────────────────────────────────────────────────────────────────────────────
-BQ_PROJECT        = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
-BQ_DATASET        = os.getenv("BQ_DATASET", "uploads")
-BQ_REVENUE_TABLE  = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
-BQ_COST_TABLE     = os.getenv("BQ_COST_TABLE", "cost_test_databot")
-VERTEX_LOCATION   = os.getenv("VERTEX_LOCATION", "europe-west1")
+BQ_PROJECT         = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
+BQ_DATASET         = os.getenv("BQ_DATASET", "uploads")
+BQ_REVENUE_TABLE   = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
+BQ_COST_TABLE      = os.getenv("BQ_COST_TABLE", "cost_test_databot")
+VERTEX_LOCATION    = os.getenv("VERTEX_LOCATION", "europe-west1")
 LOCAL_TZ          = os.getenv("LOCAL_TZ", "Europe/Kyiv")
 
-BQ_LOG_TABLE      = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
+BQ_LOG_TABLE       = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -63,7 +63,7 @@ try:
 except Exception:
     logger.warning("Vertex init failed", exc_info=True)
 
-model = GenerativeModel("gemini-2.5-flash")
+model = GenerativeModel("gemini-2.0-flash") # Оновлено до актуальної версії flash
 
 query_cache = {}
 cache_ttl = 300
@@ -159,10 +159,20 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
+    """
+    Додає умову в SQL, перевіряючи чи вже існує блок WHERE.
+    """
     sql_lower = sql.lower()
     if condition_sql.lower() in sql_lower:
         return sql
+
+    # Регулярка для пошуку першого блоку FROM таблиця
+    # Враховує назви з кавичками та префіксами проектів
+    from_pattern = r"(\bfrom\b\s+`?[\w\-\.:]+`?)"
+    
+    # Перевіряємо, чи є WHERE саме після блоку FROM (спрощено)
     if " where " in f" {sql_lower} ":
+        # Якщо WHERE вже є, додаємо нашу умову як першу через AND
         return re.sub(
             r"\bwhere\b",
             f"WHERE {condition_sql} AND",
@@ -170,13 +180,15 @@ def _ensure_where_filter(sql: str, condition_sql: str) -> str:
             flags=re.IGNORECASE,
             count=1,
         )
-    return re.sub(
-        r"(\bfrom\b\s+`?[\w\-\.:]+`?)",
-        r"\1 WHERE " + condition_sql,
-        sql,
-        flags=re.IGNORECASE,
-        count=1,
-    )
+    else:
+        # Якщо WHERE немає, додаємо його після FROM
+        return re.sub(
+            from_pattern,
+            r"\1 WHERE " + condition_sql,
+            sql,
+            flags=re.IGNORECASE,
+            count=1,
+        )
 
 # >>> preload schemas
 _ = get_all_schemas()
@@ -307,7 +319,7 @@ def _sanitize_division_by_zero(sql: str) -> str:
     )
     sql = re.sub(r"\b[A-Za-z_]+/[A-Za-z_]+\b", protect, sql)
     sql = re.sub(
-        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>\b[\w\.]+\b)\s*/\s*(?P<b>\b[\w\.]+\b)""",
+        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>[\w\.\`]+)\s*/\s*(?P<b>[\w\.\`]+)""",
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE | re.IGNORECASE,
@@ -381,7 +393,7 @@ def find_matches_with_ai_cached(instruction: str, smap_json: str):
     try:
         resp = model.generate_content(prompt, generation_config={"temperature": 0})
         txt = resp.text.strip()
-        if txt == "NONE":
+        if txt == "NONE" or not txt:
             return []
         out = []
         for part in txt.split(","):
@@ -426,9 +438,6 @@ def split_into_separate_queries(message: str) -> list:
 
 ПРАВИЛА (CRITICAL):
 1. НЕ РОЗБИВАЙ запит, якщо частини є уточненнями (фільтри часу, групування, умови).
-   - "Покажи дохід за останні 3 місяці потижнево" -> ЦЕ ОДИН ЗАПИТ.
-   - "Який дохід у травні та який у червні" -> ЦЕ ДВА ЗАПИТИ.
-   - "Дохід по країнах за 2024 рік" -> ЦЕ ОДИН ЗАПИТ.
 2. Фільтри часу ЗАВЖДИ повинні залишатися разом із метрикою.
 3. Інструкції з групування ЗАВЖДИ залишаються в основному запиті.
 
@@ -525,22 +534,14 @@ COST: {json.dumps(cost_schema, indent=2)}
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     
+    # ПРАВКА: Очищення SQL перед трансформаціями
     sql = sql.replace("```sql", "").replace("```", "").strip()
 
     match = re.search(r"(SELECT|WITH)\s.*", sql, re.IGNORECASE | re.DOTALL)
     if match:
         sql = match.group(0)
         
-    sql = re.sub(
-        r"(?<!SAFE_DIVIDE\()(?P<a>[\w\.\`]+)\s*/\s*(?P<b>[\w\.\`]+)", 
-        r"SAFE_DIVIDE(\g<a>, \g<b>)", 
-        sql
-    )
-
-    match = re.search(r"(SELECT|WITH)\s.*", sql, re.IGNORECASE | re.DOTALL)
-    if match:
-        sql = match.group(0)
-        
+    # ПРАВКА: Послідовні санітайзери (тільки один раз!)
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
@@ -569,8 +570,8 @@ COST: {json.dumps(cost_schema, indent=2)}
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
-            if f"event_type = '{event_type}'" not in sql.lower():
-                sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+            # Виправлена логіка додавання WHERE через _ensure_where_filter
+            sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
@@ -595,12 +596,10 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     error_details = None
     final_response = ""
 
-    # >>> ФІКС: Текст повідомлення про ліміт
     TOKEN_LIMIT_MSG = (
         "⚠️ **Обмеження контексту (Token Limit Exceeded)**\n\n"
         "Ми зіткнулися з обмеженням контекстного вікна при роботі у довгих тредах Slack. "
-        "Як рішення, ми рекомендуємо розбивати різні аналітичні задачі на окремі треди, "
-        "щоб підтримувати високу швидкість та точність відповідей ШІ."
+        "Як рішення, ми рекомендуємо розбивати різні аналітичні задачі на окремі треди."
     )
 
     try:
@@ -610,8 +609,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         if (is_trend_question(instruction_part) and not has_explicit_date(instruction_part)):
             final_response = (
                 "❗ Для аналізу динаміки потрібен часовий період.\n\n"
-                "Будь ласка, уточніть, наприклад:\n"
-                "• за який місяць?\n• порівняння яких періодів?\n• конкретний діапазон дат (від–до)"
+                "Будь ласка, уточніть період (наприклад, за травень або за останні 3 місяці)."
             )
             return final_response
         
@@ -620,7 +618,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         for field, value in matched:
             augmented_instruction += f" ({field}='{value}')"
 
-        # Спроба генерації SQL з перевіркою на ліміт токенів
         try:
             generated_sql = generate_sql(augmented_instruction, smap)
         except Exception as e:
@@ -639,7 +636,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            # ВНУТРІШНІ ФУНКЦІЇ РЕНДЕРУ (БЕЗ ЗМІН)
             def render_table(df: pd.DataFrame, limit: int = 10) -> str:
                 df = df.copy()
                 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
@@ -663,7 +659,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 label_col = label_cols[0] if label_cols else df.columns[0]
                 df = df.sort_values(by=val_col, ascending=False).head(limit)
                 values, labels = df[val_col].fillna(0).tolist(), df[label_col].astype(str).tolist()
-                max_val = max(values) if max(values) > 0 else 1
+                max_val = max(values) if values and max(values) > 0 else 1
                 lines = ["📊 *TOP-10 графік*"]
                 for label, val in zip(labels, values):
                     bar = "█" * int((val / max_val) * 30)
@@ -674,7 +670,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             ascii_md = render_ascii_chart(df)
             final_display = f"```\n{table_md}\n```\n{ascii_md}"
 
-            # ПРОМПТ АНАЛІЗУ
             analysis_prompt = f"Ти — фінансовий аналітик. Поясни дані: {df.to_csv(index=False)}. Запит: {instruction_part}"
             
             try:
@@ -723,4 +718,3 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
-
