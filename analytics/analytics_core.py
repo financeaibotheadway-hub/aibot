@@ -532,26 +532,6 @@ COST: {json.dumps(cost_schema, indent=2)}
         sql,
         flags=re.IGNORECASE | re.MULTILINE,)
 
-    rev_schema, cost_schema = get_all_schemas()
-    allowed_columns = {c["name"].lower() for c in rev_schema} | {c["name"].lower() for c in cost_schema}
-    
-    # Витягуємо слова, що можуть бути колонками (ігноруючи рядки в лапках)
-    sql_for_check = re.sub(r"'[^']*'", '', sql.lower())
-    potential_cols = set(re.findall(r'\b[a-z_][a-z0-9_]*\b', sql_for_check))
-    
-    sql_keywords = {
-        'select', 'from', 'where', 'group', 'by', 'order', 'limit', 'as', 'and', 'or', 
-        'sum', 'count', 'avg', 'date', 'current_date', 'extract', 'interval', 'month', 
-        'year', 'week', 'left', 'join', 'on', 'abs', 'safe_divide', 'with', 'over', 
-        'partition', 'rows', 'between', 'is', 'not', 'null', 'desc', 'asc', 'case', 'when', 'then', 'end'
-    }
-
-    found_bad_cols = [c for c in potential_cols if c not in sql_keywords and c not in allowed_columns and not re.match(r'^t\d+$|^cte|^f0_$', c)]
-
-    if found_bad_cols:
-        bad_str = ", ".join([f"`{c}`" for c in found_bad_cols])
-        raise ValueError(f"🤖 У базі даних немає полів: {bad_str}. Будь ласка, перефразуй запит.")
-
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
@@ -734,3 +714,4 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
+
