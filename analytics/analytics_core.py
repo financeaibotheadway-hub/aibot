@@ -163,24 +163,48 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
-    sql_lower = sql.lower()
-    if condition_sql.lower() in sql_lower:
+    """
+    Розумне додавання WHERE.
+    1. Якщо WHERE вже є -> додаємо AND ...
+    2. Якщо WHERE немає -> вставляємо WHERE після FROM, але ПЕРЕД GROUP BY/ORDER BY/LIMIT.
+    """
+    sql_upper = sql.upper()
+    
+    # Якщо умова вже є (груба перевірка)
+    if condition_sql.upper() in sql_upper:
         return sql
-    if " where " in f" {sql_lower} ":
-        return re.sub(
-            r"\bwhere\b",
-            f"WHERE {condition_sql} AND",
-            sql,
-            flags=re.IGNORECASE,
-            count=1,
-        )
-    return re.sub(
-        r"(\bfrom\b\s+`?[\w\-\.:]+`?)",
-        r"\1 WHERE " + condition_sql,
-        sql,
-        flags=re.IGNORECASE,
-        count=1,
-    )
+
+    # Перевіряємо наявність WHERE
+    where_match = re.search(r"\bWHERE\b", sql_upper)
+    
+    if where_match:
+        # Вставляємо одразу після WHERE
+        # Використовуємо replace, щоб зберегти регістр оригінального запиту
+        # Але треба бути обережним, замінюємо лише перше входження WHERE
+        pattern = re.compile(r"\bwhere\b", re.IGNORECASE)
+        return pattern.sub(f"WHERE {condition_sql} AND", sql, count=1)
+    else:
+        # Шукаємо FROM ... TABLE ...
+        # І вставляємо WHERE перед GROUP BY, ORDER BY, LIMIT, WINDOW, HAVING або кінцем рядка
+        # Pattern: find FROM clause, then lookahead for keywords or EOS
+        
+        # Спрощений підхід: знаходимо FROM і кінець назви таблиці
+        # Потім вставляємо WHERE.
+        # Але найбезпечніше: знайти ключові слова, які мають йти ПІСЛЯ where
+        keywords_pattern = r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|WINDOW|HAVING|UNION)\b"
+        match = re.search(keywords_pattern, sql, re.IGNORECASE)
+        
+        if match:
+            # Вставляємо перед знайденим ключовим словом
+            idx = match.start()
+            return sql[:idx] + f" WHERE {condition_sql} " + sql[idx:]
+        else:
+            # Якщо немає GROUP/ORDER/LIMIT, просто додаємо в кінець (але після FROM)
+            # Перевіряємо, чи є FROM (може бути просто SELECT 1)
+            if "FROM" in sql_upper:
+                return sql + f" WHERE {condition_sql}"
+            
+    return sql
 
 # >>> preload schemas
 _ = get_all_schemas()
@@ -322,10 +346,26 @@ def _sanitize_division_by_zero(sql: str) -> str:
         flags=re.IGNORECASE,
     )
     
-    # Revert to more robust regex that supports backticks and doesn't rely on \b for boundaries
-    sql = re.sub(r"\b[A-Za-z_]+/[A-Za-z_]+\b", protect, sql)
+    # Fix for "Double function call parentheses" and "Syntax Error"
+    # Only replace a / b when a and b are simple alphanumeric identifiers (or dot/tick).
+    # Do NOT replace if it looks like a function call `SUM(...) / ...` or `... / count(...)`
+    # because that's where regex usually fails.
+    
+    # Simple, safer regex: match `word / word` or `word.word / word`
+    # We use \b to ensure boundaries.
+    
+    # This regex looks for:
+    # (word or `word` or word.word) / (word or `word` or word.word)
+    # It deliberately ignores anything with parens () to avoid breaking function calls.
+    
+    safe_div_pattern =_regex = r"""
+        (?P<a>\b[`a-zA-Z0-9_\.]+\b)   # Numerator: simple identifier
+        \s*/\s*                       # Division operator
+        (?P<b>\b[`a-zA-Z0-9_\.]+\b)   # Denominator: simple identifier
+    """
+    
     sql = re.sub(
-        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>[\w\.\`]+)\s*/\s*(?P<b>[\w\.\`]+)""",
+        safe_div_pattern,
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE | re.IGNORECASE,
@@ -543,16 +583,21 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
    - НЕ обривай запит на середині.
 
-6. ЗАГАЛЬНІ:
+6. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились" або "new revenue"):
+   - ⚠️ ОБОВ'ЯЗКОВО включай колонку ДАТИ в SELECT (наприклад `MIN(date)` as `first_seen`), навіть якщо користувач не просив. Це потрібно для аналізу.
+   - Використовуй логіку: `SELECT vendor_name, MIN(date) as first_seen FROM ... GROUP BY vendor_name HAVING first_seen >= 'YYYY-01-01'`.
+   
+7. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
    - Якщо запит про "revenue/дохід" — таблиця `{REVENUE_TABLE_REF}`. Якщо "cost/витрати" — `{COST_TABLE_REF}`.
    - Для агрегатів завжди давай alias (наприклад `total_revenue`).
    - Якщо питають "скільки" або "sum" БЕЗ уточнення "по днях/тижнях/категоріях" — НЕ використовуй GROUP BY.
    - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
    - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
+   - НЕ використовуй SAFE_DIVIDE сам, це зробить авто-корекція. Просто пиши `/`.
    - Поверни ТІЛЬКИ SQL код.
    
-7. СПЕЦИФІЧНІ ТЕРМІНИ:
+8. СПЕЦИФІЧНІ ТЕРМІНИ:
    - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
    - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
 """
