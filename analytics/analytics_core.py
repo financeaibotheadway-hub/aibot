@@ -520,6 +520,11 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Revenue -> `{REVENUE_TABLE_REF}`, Cost -> `{COST_TABLE_REF}`.
    - Trial -> `event_name = 'sale'` AND `product_id LIKE '%trial%'`.
    - Поверни ТІЛЬКИ SQL код.
+   
+7. РОЗРАХУНОК ВИТРАТ (COST):
+   - Завжди використовуй `SUM(amount_lcy)` для підсумків.
+   - Якщо значення в таблиці від'ємні (витрати з мінусом), використовуй `-SUM(amount_lcy)`, щоб показати результат як додатне число.
+   - НІКОЛИ не використовуй ABS(), щоб не спотворити суму при наявності коригувань.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -538,18 +543,6 @@ COST: {json.dumps(cost_schema, indent=2)}
 
     sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
     sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
-
-    if (
-        account_no is not None
-        and year is not None
-        and re.search(r"\b(скільки|sum|total)\b", instruction_part.lower())
-        and not _needs_breakdown(instruction_part)
-    ):
-        preferred = ["posting_date", "date", "dt", "transaction_date"]
-        date_col = next((c for c in preferred if _schema_has_column(cost_schema, c)), None)
-        if not date_col: raise ValueError("No date column found in COST table")
-    
-        return f"SELECT SUM(amount_lcy) * -1 AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
 
     if account_no is not None and REVENUE_TABLE_REF in sql:
         raise ValueError("INVALID SQL: revenue table used for account-based cost query")
