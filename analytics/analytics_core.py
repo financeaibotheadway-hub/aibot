@@ -131,7 +131,7 @@ def _needs_breakdown(text: str) -> bool:
         "розподіл", "distribution",  
         "динамік", "trend",          
         "legal_entity", "юрсоб",
-        "retained", "new", "тип", "type" # Added explicitly for retained/new breakdown logic
+        "retained", "new", "тип", "type" 
     ]
     t = text.lower()
     return any(k in t for k in keywords)
@@ -162,22 +162,17 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     """
     Додає умову в SQL, перевіряючи чи вже існує блок WHERE.
-    Покращено для уникнення помилок у складних запитах.
     """
     sql_lower = sql.lower()
     if condition_sql.lower() in sql_lower:
         return sql
 
-    # Патерн для знаходження WHERE як окремого слова (не в назвах таблиць)
     where_match = re.search(r"\bwhere\b", sql_lower)
     
     if where_match:
-        # Додаємо умову відразу після WHERE
         idx = where_match.start()
         return sql[:idx+5] + f" {condition_sql} AND " + sql[idx+5:]
     else:
-        # Якщо WHERE немає, шукаємо останній FROM (найчастіше це головна таблиця в простих запитах)
-        # Або перший FROM для CTE. Тут використовуємо логіку після першого знайденого FROM таблиці.
         from_pattern = r"(\bfrom\b\s+`?[\w\-\.:]+`?)"
         match = re.search(from_pattern, sql, flags=re.IGNORECASE)
         if match:
@@ -426,7 +421,7 @@ def split_into_separate_queries(message: str) -> list:
 
     try:
         current_date_str = datetime.now().strftime('%Y-%m-%d')
-        # UPDATED PROMPT: Added logic to KEEP combination queries together (e.g. which dominates + %)
+        # UPDATED PROMPT: Added rule #4 to prevent splitting "new/not present before" logic
         prompt = f"""
 Ти — експертний аналітик. Твоє завдання — визначити, чи містить повідомлення користувача ДЕКІЛЬКА РІЗНИХ питань, чи це ОДНЕ складне питання.
 Сьогоднішня дата: {current_date_str}
@@ -435,7 +430,7 @@ def split_into_separate_queries(message: str) -> list:
 1. НЕ РОЗБИВАЙ запит, якщо частини є уточненнями (фільтри часу, групування, умови).
 2. Фільтри часу ЗАВЖДИ повинні залишатися разом із метрикою.
 3. Якщо друге питання питає про ВІДСОТОК, ЧАСТКУ або СПІВВІДНОШЕННЯ (share, percentage) того, що було в першому — НЕ РОЗБИВАЙ. Це один аналітичний запит.
-4. "Retained vs New" — це ОДИН запит на порівняння.
+4. Фрази типу "і до цього їх не було", "та раніше не купували", "and not present before" — це УМОВА ВИКЛЮЧЕННЯ (NOT IN). Це частина одного запиту. НЕ РОЗБИВАЙ.
 
 Повідомлення: "{message}"
 
@@ -455,7 +450,6 @@ def split_into_separate_queries(message: str) -> list:
         for ln in lines:
             if ln.startswith("ЗАПИТ_"):
                 q = ln.split(":", 1)[1].strip()
-                # FIX 1: Filter empty strings immediately
                 if q: 
                     out.append(q)
         return out if out else [message]
@@ -522,8 +516,9 @@ COST: {json.dumps(cost_schema, indent=2)}
 5. ТРЕНДИ ТА CTE:
    - Запит ПОВИНЕН бути завершеним `SELECT * FROM CTE_NAME`.
    
-6. НОВІ / ACQUISITION (Якщо питають "які нові з'явились, яких не було"):
-   - Використовуй `WHERE id NOT IN (SELECT id FROM ... WHERE date < start_date)`.
+6. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились, яких не було"):
+   - Використовуй логіку: `SELECT vendor_name FROM ... WHERE date >= ... AND vendor_name NOT IN (SELECT vendor_name FROM ... WHERE date < ...)`
+   - "Контрагент" зазвичай = `account_name` (в COST) або `user_id` (в REVENUE).
 
 7. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми.
@@ -535,14 +530,12 @@ COST: {json.dumps(cost_schema, indent=2)}
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     
-    # ПРАВКА: Більш агресивне очищення SQL
     sql = re.sub(r"```sql|```", "", sql).strip()
 
     match = re.search(r"(SELECT|WITH)\s.*", sql, re.IGNORECASE | re.DOTALL)
     if match:
         sql = match.group(0)
         
-    # ПРАВКА: Послідовні санітайзери
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
@@ -563,7 +556,6 @@ COST: {json.dumps(cost_schema, indent=2)}
         return f"SELECT SUM(ABS(amount_lcy)) AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
 
     if account_no is not None and REVENUE_TABLE_REF in sql:
-        # Спроба пофіксити, якщо AI помилився таблицею для аккаунтів
         sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
     
     if metric in {"cost", "opex", "expense", "expenses"} and REVENUE_TABLE_REF in sql:
@@ -671,7 +663,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             ascii_md = render_ascii_chart(df)
             final_display = f"```\n{table_md}\n```\n{ascii_md}"
 
-            # ПРАВКА: Лімітуємо дані для аналізу (head 50), щоб не впасти по токенах
             data_for_ai = df.head(50).to_csv(index=False)
 
             analysis_prompt = f"""
@@ -725,8 +716,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     queries = split_into_separate_queries(message)
-    # FIX 2: Explicitly filter out empty/whitespace-only queries
-    queries = [q for q in queries if q.strip()]
+    # FIX: Більш жорстка фільтрація пустих запитів (довжина > 2)
+    queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
 
     if not queries:
         return "Не вдалося розпізнати запит."
