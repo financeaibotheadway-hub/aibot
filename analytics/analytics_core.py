@@ -526,15 +526,19 @@ COST: {json.dumps(cost_schema, indent=2)}
     sql = resp.text.strip()
     
     sql = sql.replace("```sql", "").replace("```", "").strip()
+
+    match = re.search(r"(SELECT|WITH)\s.*", sql, re.IGNORECASE | re.DOTALL)
+    if match:
+        sql = match.group(0)
+        
     sql = re.sub(
-        r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
-        "",
-        sql,
-        flags=re.IGNORECASE | re.MULTILINE,)
+        r"(?<!SAFE_DIVIDE\()(?P<a>[\w\.\`]+)\s*/\s*(?P<b>[\w\.\`]+)", 
+        r"SAFE_DIVIDE(\g<a>, \g<b>)", 
+        sql
+    )
 
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
-    sql = _sanitize_division_by_zero(sql)
 
     sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
     sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
