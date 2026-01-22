@@ -713,15 +713,60 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            # === ЛОГІКА ВИЗНАЧЕННЯ "СПИСКУ ТРАНЗАКЦІЙ" (ПОВЕРНУТО З MODE 1) ===
+            # === RENDER FUNCTIONS (MOVED UP FOR GLOBAL USE) ===
+            def render_table(df: pd.DataFrame, limit: int = 10) -> str:
+                df = df.copy()
+                num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                if num_cols:
+                    df = df.sort_values(by=num_cols[0], ascending=False)
+                df = df.head(limit)
+                for col in num_cols:
+                    df[col] = df[col].round(2).map(
+                        lambda x: f"{x:,.2f}".replace(",", " ")
+                        if pd.notnull(x) else ""
+                    )
+                df = df.astype(str)
+                col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
+                header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
+                separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |")
+                return "\n".join([header, separator] + rows)
+
+            def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
+                df = df.copy()
+                num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                if not num_cols:
+                    return ""
+                val_col = num_cols[0]
+                label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
+                label_col = label_cols[0] if label_cols else df.columns[0]
+                df = df.sort_values(by=val_col, ascending=False).head(limit)
+                values = df[val_col].fillna(0).tolist()
+                labels = df[label_col].astype(str).tolist()
+                max_len = 30
+                max_val = max(values) if max(values) > 0 else 1
+                lines = ["📊 *TOP-10 графік*"]
+                for label, val in zip(labels, values):
+                    bar_len = int((val / max_val) * max_len)
+                    bar = "█" * bar_len
+                    val_fmt = f"{val:,.2f}".replace(",", " ")
+                    lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
+                return "\n".join(lines)
+
+            # === ЛОГІКА ВИЗНАЧЕННЯ ТИПУ ВІДПОВІДІ ===
             is_detailed_transaction_list = False
             col_names = [c.lower() for c in df.columns]
             has_user_id = any(x in col_names for x in ['user_id', 'email', 'account_no', 'customer_id'])
             has_date = any(x in col_names for x in ['date', 'order_date', 'transaction_date', 'event_date', 'posting_date'])
             
-            # Якщо є ID юзера/рахунку, дата і менше 30 рядків -> це детальний список
+            # 1. Список транзакцій (ID + Дата + мало рядків)
             if has_user_id and has_date and len(df) < 30 and len(df) > 0:
                 is_detailed_transaction_list = True
+            
+            # 2. Одна відповідь (1 рядок) — ДЛЯ ТОЧНИХ ЗАПИТІВ (Фікс для "У якому місяці...")
+            is_single_row_answer = (len(df) == 1)
 
             data_for_ai = df.head(50).to_csv(index=False)
             final_display = ""
@@ -729,8 +774,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
             # === РОЗГАЛУЖЕННЯ ВІДОБРАЖЕННЯ ===
             if is_detailed_transaction_list:
-                # ВАРІАНТ 1: Текстовий список (як на скрінах)
-                # Таблицю НЕ виводимо в final_display
+                # ВАРІАНТ 1: Текстовий список
                 analysis_prompt = f"""
 Ти — старший фінансовий аналітик Headway. 
 Твоє завдання — проаналізувати транзакції конкретного користувача/контрагента і вивести їх у чіткому структурованому форматі.
@@ -754,54 +798,33 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
       
 3. **Висновки фінансового аналітика** (після списку):
    * **Загалом**: Порахуй суму (LTV) або загальний обсяг.
-   * **Поведінка**: Опиши життєвий цикл (тріал -> підписка -> скасування тощо).
+   * **Поведінка**: Опиши життєвий цикл.
    * **Інше**: Цінова стратегія, географія.
 
 Пиши українською мовою. Використовуй Markdown (bold) для ключів.
 """
+            elif is_single_row_answer:
+                # ВАРІАНТ 2: Пряма відповідь (Фікс для скріна 2)
+                table_md = render_table(df)
+                final_display = f"```\n{table_md}\n```\n\n"
+                
+                analysis_prompt = f"""
+Ти — фінансовий аналітик.
+SQL запит повернув ОДНЕ значення/рядок. Це і є ПРЯМА ВІДПОВІДЬ.
+Не пиши про "недостатньо даних" або "відсутність контексту".
+
+Дані:
+{data_for_ai}
+
+Запит: "{instruction_part}"
+
+1. 🎯 **Відповідь**: Чітко сформулюй відповідь на основі значення в таблиці.
+2. 💡 **Інсайт** (опціонально): Якщо це метрика (сума, відсоток), дай короткий коментар (багато це чи мало).
+
+Використовуй емоджі та жирний шрифт для акцентів.
+"""
             else:
-                # ВАРІАНТ 2: Стандартна таблиця + графік (для агрегацій)
-                def render_table(df: pd.DataFrame, limit: int = 10) -> str:
-                    df = df.copy()
-                    num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-                    if num_cols:
-                        df = df.sort_values(by=num_cols[0], ascending=False)
-                    df = df.head(limit)
-                    for col in num_cols:
-                        df[col] = df[col].round(2).map(
-                            lambda x: f"{x:,.2f}".replace(",", " ")
-                            if pd.notnull(x) else ""
-                        )
-                    df = df.astype(str)
-                    col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
-                    header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
-                    separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
-                    rows = []
-                    for _, row in df.iterrows():
-                        rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |")
-                    return "\n".join([header, separator] + rows)
-
-                def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
-                    df = df.copy()
-                    num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-                    if not num_cols:
-                        return ""
-                    val_col = num_cols[0]
-                    label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
-                    label_col = label_cols[0] if label_cols else df.columns[0]
-                    df = df.sort_values(by=val_col, ascending=False).head(limit)
-                    values = df[val_col].fillna(0).tolist()
-                    labels = df[label_col].astype(str).tolist()
-                    max_len = 30
-                    max_val = max(values) if max(values) > 0 else 1
-                    lines = ["📊 *TOP-10 графік*"]
-                    for label, val in zip(labels, values):
-                        bar_len = int((val / max_val) * max_len)
-                        bar = "█" * bar_len
-                        val_fmt = f"{val:,.2f}".replace(",", " ")
-                        lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
-                    return "\n".join(lines)
-
+                # ВАРІАНТ 3: Стандартна таблиця + графік (для агрегацій)
                 table_md = render_table(df)
                 ascii_md = render_ascii_chart(df)
                 final_display = f"```\n{table_md}\n```\n{ascii_md}\n\n"
@@ -817,7 +840,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 ІНСТРУКЦІЇ:
 1. Обов'язково розрахуй частки (відсотки) та пропорції, якщо це доречно.
 2. Якщо у даних є чітке домінування, обов'язково акцентуй на цьому.
-3. Якщо результат SQL є єдиним числом або рядком (наприклад, конкретна дата або сума), ВВАЖАЙ ЦЕ КІНЦЕВОЮ ВІДПОВІДДЮ. Не пиши "недостатньо даних", якщо SQL вже відфільтрував потрібне.
+3. Пиши короткими тезами (буллітами).
+4. Якщо бачиш аномалії або важливі тренди — виділи їх окремо.
+5. Дай інсайт, а не просто переказуй цифри.
 4. Оформлення:
    - Використовуй Emoji (🎯 для відповіді, 📊 для деталей, 💡 для інсайтів).
    - Використовуй > Blockquotes для головних висновків.
