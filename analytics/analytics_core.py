@@ -30,14 +30,15 @@ from analytics.trend_analysis import run_trend_analysis
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV / LOGGING SETUP
 # ──────────────────────────────────────────────────────────────────────────────
-BQ_PROJECT         = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
-BQ_DATASET         = os.getenv("BQ_DATASET", "uploads")
-BQ_REVENUE_TABLE   = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
-BQ_COST_TABLE      = os.getenv("BQ_COST_TABLE", "cost_test_databot")
-VERTEX_LOCATION    = os.getenv("VERTEX_LOCATION", "europe-west1")
-LOCAL_TZ           = os.getenv("LOCAL_TZ", "Europe/Kyiv")
+BQ_PROJECT       = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
+BQ_DATASET       = os.getenv("BQ_DATASET", "uploads")
+BQ_REVENUE_TABLE = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
+BQ_COST_TABLE    = os.getenv("BQ_COST_TABLE", "cost_test_databot")
+VERTEX_LOCATION  = os.getenv("VERTEX_LOCATION", "europe-west1")
+LOCAL_TZ         = os.getenv("LOCAL_TZ", "Europe/Kyiv")
 
-BQ_LOG_TABLE       = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
+# Ім'я таблиці для логів
+BQ_LOG_TABLE     = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -63,14 +64,17 @@ try:
 except Exception:
     logger.warning("Vertex init failed", exc_info=True)
 
-model = GenerativeModel("gemini-2.0-flash") 
+model = GenerativeModel("gemini-2.5-flash")
 
 query_cache = {}
 cache_ttl = 300
 
 _schema_cache = {}
 _schema_time  = {}
+
+# Флаг, щоб перевіряти наявність таблиці логів лише 1 раз за запуск
 _log_table_checked = False 
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -130,8 +134,7 @@ def _needs_breakdown(text: str) -> bool:
         "структур", "structure",     
         "розподіл", "distribution",  
         "динамік", "trend",          
-        "legal_entity", "юрсоб",
-        "retained", "new", "тип", "type" 
+        "legal_entity", "юрсоб"      
     ]
     t = text.lower()
     return any(k in t for k in keywords)
@@ -160,24 +163,24 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
-    """
-    Додає умову в SQL, перевіряючи чи вже існує блок WHERE.
-    """
     sql_lower = sql.lower()
     if condition_sql.lower() in sql_lower:
         return sql
-
-    where_match = re.search(r"\bwhere\b", sql_lower)
-    
-    if where_match:
-        idx = where_match.start()
-        return sql[:idx+5] + f" {condition_sql} AND " + sql[idx+5:]
-    else:
-        from_pattern = r"(\bfrom\b\s+`?[\w\-\.:]+`?)"
-        match = re.search(from_pattern, sql, flags=re.IGNORECASE)
-        if match:
-            return re.sub(from_pattern, r"\1 WHERE " + condition_sql, sql, flags=re.IGNORECASE, count=1)
-        return sql
+    if " where " in f" {sql_lower} ":
+        return re.sub(
+            r"\bwhere\b",
+            f"WHERE {condition_sql} AND",
+            sql,
+            flags=re.IGNORECASE,
+            count=1,
+        )
+    return re.sub(
+        r"(\bfrom\b\s+`?[\w\-\.:]+`?)",
+        r"\1 WHERE " + condition_sql,
+        sql,
+        flags=re.IGNORECASE,
+        count=1,
+    )
 
 # >>> preload schemas
 _ = get_all_schemas()
@@ -187,6 +190,7 @@ _ = get_all_schemas()
 # BIGQUERY LOGGING LOGIC
 # ──────────────────────────────────────────────────────────────────────────────
 def _ensure_log_table_exists():
+    """Створює таблицю логів, якщо її не існує"""
     global _log_table_checked
     if _log_table_checked:
         return
@@ -215,7 +219,9 @@ def _ensure_log_table_exists():
             logger.error(f"Failed to create log table: {e}")
 
 def log_interaction(user_id, prompt, sql, response, duration, status, error_msg=None):
+    """Записує лог в BigQuery"""
     _ensure_log_table_exists()
+
     try:
         rows = [{
             "event_timestamp": datetime.now().isoformat(),
@@ -227,6 +233,7 @@ def log_interaction(user_id, prompt, sql, response, duration, status, error_msg=
             "status": status,
             "error_message": str(error_msg) if error_msg else None
         }]
+        
         errors = bq_client.insert_rows_json(BQ_LOG_TABLE, rows)
         if errors:
             logger.error(f"BQ Logging errors: {errors}")
@@ -308,7 +315,7 @@ def _sanitize_division_by_zero(sql: str) -> str:
     )
     sql = re.sub(r"\b[A-Za-z_]+/[A-Za-z_]+\b", protect, sql)
     sql = re.sub(
-        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>[\w\.\`]+)\s*/\s*(?P<b>[\w\.\`]+)""",
+        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>\b[\w\.]+\b)\s*/\s*(?P<b>\b[\w\.]+\b)""",
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE | re.IGNORECASE,
@@ -382,7 +389,7 @@ def find_matches_with_ai_cached(instruction: str, smap_json: str):
     try:
         resp = model.generate_content(prompt, generation_config={"temperature": 0})
         txt = resp.text.strip()
-        if txt == "NONE" or not txt:
+        if txt == "NONE":
             return []
         out = []
         for part in txt.split(","):
@@ -421,22 +428,22 @@ def split_into_separate_queries(message: str) -> list:
 
     try:
         current_date_str = datetime.now().strftime('%Y-%m-%d')
-        # UPDATED PROMPT: More aggressive rules to prevent splitting logic like "new/not present before"
         prompt = f"""
 Ти — експертний аналітик. Твоє завдання — визначити, чи містить повідомлення користувача ДЕКІЛЬКА РІЗНИХ питань, чи це ОДНЕ складне питання.
 Сьогоднішня дата: {current_date_str}
 
 ПРАВИЛА (CRITICAL):
 1. НЕ РОЗБИВАЙ запит, якщо частини є уточненнями (фільтри часу, групування, умови).
-2. Фільтри часу ЗАВЖДИ повинні залишатися разом із метрикою.
-3. Якщо друге питання питає про ВІДСОТОК, ЧАСТКУ або СПІВВІДНОШЕННЯ (share, percentage) того, що було в першому — НЕ РОЗБИВАЙ.
-4. Фрази типу "і до цього їх не було", "та раніше не купували", "які з'явились" — це ВСЕ ОДИН ЗАПИТ (Acquisition/New). НЕ РОЗБИВАЙ.
-5. Сполучники "і", "та", "and" всередині речення часто поєднують умови. Якщо сумніваєшся — НЕ РОЗБИВАЙ.
+   - "Покажи дохід за останні 3 місяці потижнево" -> ЦЕ ОДИН ЗАПИТ. (Тут є метрика + час + групування).
+   - "Який дохід у травні та який у червні" -> ЦЕ ДВА ЗАПИТИ.
+   - "Дохід по країнах за 2024 рік" -> ЦЕ ОДИН ЗАПИТ.
+2. Фільтри часу ("останні 3 місяці", "вчора", "минулого тижня") ЗАВЖДИ повинні залишатися разом із метрикою, до якої вони відносяться.
+3. Інструкції з групування ("потижнево", "по центрах", "weekly") ЗАВЖДИ залишаються в основному запиті.
 
 Повідомлення: "{message}"
 
-Якщо це один запит (або послідовний аналіз), поверни його ж без змін.
-Якщо декілька НЕЗАЛЕЖНИХ, поверни у форматі:
+Якщо це один запит, поверни його ж.
+Якщо декілька, поверни у форматі:
 ЗАПИТ_1: ...
 ЗАПИТ_2: ...
 """
@@ -451,8 +458,7 @@ def split_into_separate_queries(message: str) -> list:
         for ln in lines:
             if ln.startswith("ЗАПИТ_"):
                 q = ln.split(":", 1)[1].strip()
-                if q: 
-                    out.append(q)
+                out.append(q)
         return out if out else [message]
     except Exception:
         return [message]
@@ -499,51 +505,72 @@ REVENUE: {json.dumps(rev_schema, indent=2)}
 COST: {json.dumps(cost_schema, indent=2)}
 
 Правила SQL:
-1. ЧАСОВІ ФІЛЬТРИ:
-   - Для "останні X місяців": `WHERE date_column >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL X MONTH)`.
-   - Якщо користувач НЕ вказав період, НЕ додавай умову `WHERE date ...`.
+1. ЧАСОВІ ФІЛЬТРИ ("останні 3 місяці", "минулий рік" тощо):
+   - Використовуй поле дати (наприклад `order_date`, `date`, `created_at` — яке є в схемі).
+   - Для "останні X місяців" використовуй: `WHERE date_column >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL X MONTH)`.
+   - Не використовуй `BETWEEN` зі статичними датами, якщо просять відносний період ("останні...").
+   - ⚠️ ВАЖЛИВО: Якщо користувач НЕ вказав конкретну дату чи період, НЕ додавай умову `WHERE date ...`. Аналізуй дані за весь доступний час.
 
-2. ГРУПУВАННЯ ЧАСУ:
-   - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, SELECT `AS week_start`.
-   - Обов'язково додай `ORDER BY` для графіків.
-   
+2. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
+   - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
+   - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
+   - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
+
 3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
-   - Якщо "без", "крім", "exclude" -> `AND column != 'value'`.
-   - Мапінг країн: "США/USA" -> 'US', "Україна" -> 'UA'.
+   - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
+     `AND column != 'value'` або `AND column NOT IN (...)`.
+   - Мапінг країн (для geo_country): "США/USA" -> 'US', "Україна" -> 'UA', "Британія" -> 'GB'.
+   - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
 
 4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
-   - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
+   - Якщо в запиті є назва категорії витрат (наприклад "Corporate Events", "Software licenses"), додай фільтр:
+     `WHERE account_name LIKE '%Назва%'` (наприклад `WHERE account_name LIKE '%Corporate Events%'`).
+   - Шукай це в таблиці `{COST_TABLE_REF}`.
 
 5. ТРЕНДИ ТА CTE:
-   - Запит ПОВИНЕН бути завершеним `SELECT * FROM CTE_NAME`.
-   
-6. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились, яких не було"):
-   - Використовуй логіку: `SELECT vendor_name FROM ... WHERE date >= ... AND vendor_name NOT IN (SELECT vendor_name FROM ... WHERE date < ...)`
-   - "Контрагент" зазвичай = `account_name` (в COST) або `user_id` (в REVENUE).
+   - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
+   - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
+   - НЕ обривай запит на середині.
 
-7. ЗАГАЛЬНІ:
-   - Використовуй ТІЛЬКИ поля зі схеми.
-   - Revenue -> `{REVENUE_TABLE_REF}`, Cost -> `{COST_TABLE_REF}`.
-   - Trial -> `event_name = 'sale'` AND `product_id LIKE '%trial%'`.
+6. ЗАГАЛЬНІ:
+   - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
+   - Якщо запит про "revenue/дохід" — таблиця `{REVENUE_TABLE_REF}`. Якщо "cost/витрати" — `{COST_TABLE_REF}`.
+   - Для агрегатів завжди давай alias (наприклад `total_revenue`).
+   - Якщо питають "скільки" або "sum" БЕЗ уточнення "по днях/тижнях/категоріях" — НЕ використовуй GROUP BY.
+   - Якщо запит про trial / тріали, то використовувати таблицю `{REVENUE_TABLE_REF}` і в ній брати `event_name = "sale"` і `product_id LIKE "%trial%"`.
+   - Якщо запит про айді рахунку, або питається про "рахунок", то — використовуй таблицю `{COST_TABLE_REF}` і в ній поле `account_no`.
    - Поверни ТІЛЬКИ SQL код.
+   
+7. СПЕЦИФІЧНІ ТЕРМІНИ:
+   - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
+   - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     
-    sql = re.sub(r"```sql|```", "", sql).strip()
+    # Очищення SQL
+    sql = sql.replace("```sql", "").replace("```", "").strip()
+    sql = re.sub(
+        r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
+        "",
+        sql,
+        flags=re.IGNORECASE | re.MULTILINE,)
 
-    match = re.search(r"(SELECT|WITH)\s.*", sql, re.IGNORECASE | re.DOTALL)
-    if match:
-        sql = match.group(0)
-        
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
 
+    # --- NEW FIX: Concatenated String Literals ---
+    # Якщо модель розбила текстовий рядок ('text' \n 'text'), склеюємо їх
     sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
     sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
 
+    # -------------------------------
+    # HARD ENFORCEMENT LOGIC
+    # -------------------------------
+
+    # 1. Hardcoded date logic for specific simple queries
     if (
         account_no is not None
         and year is not None
@@ -551,59 +578,85 @@ COST: {json.dumps(cost_schema, indent=2)}
         and not _needs_breakdown(instruction_part)
     ):
         preferred = ["posting_date", "date", "dt", "transaction_date"]
-        date_col = next((c for c in preferred if _schema_has_column(cost_schema, c)), None)
-        if not date_col: raise ValueError("No date column found in COST table")
+        date_col = None
+        for c in preferred:
+            if _schema_has_column(cost_schema, c):
+                date_col = c
+                break
     
-        return f"SELECT SUM(ABS(amount_lcy)) AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
-
-    if account_no is not None and REVENUE_TABLE_REF in sql:
-        sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
+        if not date_col:
+            raise ValueError("No date column found in COST table")
     
-    if metric in {"cost", "opex", "expense", "expenses"} and REVENUE_TABLE_REF in sql:
-          sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
+        return f"""
+        SELECT
+            SUM(ABS(amount_lcy)) AS total_expenses
+        FROM `{COST_TABLE_REF}`
+        WHERE account_no = {account_no}
+          AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'
+        """.strip()
 
+    # 2. Prevent wrong table usage
+    if account_no is not None:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError("INVALID SQL: revenue table used for account-based cost query")
+    
+    
+    # 3. Cost vs Revenue table check
+    if metric in {"cost", "opex", "expense", "expenses"}:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError("INVALID SQL: revenue table used for cost metric")
+
+    # 4. Apply Hard Filters
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
-            sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+            if f"event_type = '{event_type}'" not in sql.lower():
+                sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
 
+    # ПЕРЕВІРКА: Чи це взагалі SQL? (щоб уникнути помилки \320)
     cleaned_start = sql.strip().upper()
     if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
+        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу,
+        # замість того, щоб мучити BigQuery.
         raise ValueError(f"🤖 Відповідь AI (не SQL):\n\n{sql}")
 
     return sql
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EXECUTE SINGLE QUERY (WITH INTEGRATED TOKEN LIMIT FIX & LOGGING)
+# EXECUTE SINGLE QUERY (INTEGRATED FIX & LOGGING)
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown") -> str:
     start_time = time.time()
     instruction_part = instruction.strip()
     
+    # Змінні для логування
     generated_sql = None
     status = "SUCCESS"
     error_details = None
     final_response = ""
-
+    
     TOKEN_LIMIT_MSG = (
-        "⚠️ **Обмеження контексту (Token Limit Exceeded)**\n\n"
-        "Ми зіткнулися з обмеженням контекстного вікна. "
-        "Спробуйте розбити запит на менші частини або скоротити період."
+        "⚠️ **Обмеження контексту**\n"
+        "Спробуйте скоротити період або деталізувати запит."
     )
 
     try:
         if not instruction_part:
-            return "Повідомлення порожнє."
+            final_response = "Повідомлення порожнє."
+            return final_response
             
         if (is_trend_question(instruction_part) and not has_explicit_date(instruction_part)):
             final_response = (
                 "❗ Для аналізу динаміки потрібен часовий період.\n\n"
-                "Будь ласка, уточніть період (наприклад, за травень або за останні 3 місяці)."
+                "Будь ласка, уточніть, наприклад:\n"
+                "• за який місяць?\n"
+                "• порівняння яких періодів?\n"
+                "• конкретний діапазон дат (від–до)"
             )
             return final_response
         
@@ -612,16 +665,10 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         for field, value in matched:
             augmented_instruction += f" ({field}='{value}')"
 
-        try:
-            generated_sql = generate_sql(augmented_instruction, smap)
-        except Exception as e:
-            err_str = str(e).lower()
-            if any(k in err_str for k in ["429", "exhausted", "token", "quota"]):
-                status = "TOKEN_LIMIT"
-                return TOKEN_LIMIT_MSG
-            raise e
+        # === ГЕНЕРАЦІЯ SQL (ВСЕРЕДИНІ TRY) ===
+        generated_sql = generate_sql(augmented_instruction, smap)
 
-        # ВИКОНАННЯ ЗАПИТУ
+        # === ВИКОНАННЯ ЗАПИТУ ===
         df = execute_cached_query(generated_sql)
 
         if df.empty:
@@ -630,25 +677,24 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            # -- DETECTION OF TRANSACTION LIST --
-            # If the data looks like a raw transaction list for a specific entity (user/account),
-            # we want a detailed textual breakdown instead of a giant ASCII table.
-            
+            # === ЛОГІКА ВИЗНАЧЕННЯ "СПИСКУ ТРАНЗАКЦІЙ" (ПОВЕРНУТО З MODE 1) ===
             is_detailed_transaction_list = False
             col_names = [c.lower() for c in df.columns]
             has_user_id = any(x in col_names for x in ['user_id', 'email', 'account_no', 'customer_id'])
             has_date = any(x in col_names for x in ['date', 'order_date', 'transaction_date', 'event_date', 'posting_date'])
-            # Threshold: less than 30 rows (to avoid hitting token limits with large lists)
+            
+            # Якщо є ID юзера/рахунку, дата і менше 30 рядків -> це детальний список
             if has_user_id and has_date and len(df) < 30 and len(df) > 0:
                 is_detailed_transaction_list = True
 
+            data_for_ai = df.head(50).to_csv(index=False)
             final_display = ""
             analysis_prompt = ""
-            data_for_ai = df.head(50).to_csv(index=False)
 
+            # === РОЗГАЛУЖЕННЯ ВІДОБРАЖЕННЯ ===
             if is_detailed_transaction_list:
-                # --- MODE 1: DETAILED TEXTUAL BREAKDOWN (No ASCII Table) ---
-                # This matches the user request for "Screens 2, 3, 4" style
+                # ВАРІАНТ 1: Текстовий список (як на скрінах)
+                # Таблицю НЕ виводимо в final_display
                 analysis_prompt = f"""
 Ти — старший фінансовий аналітик Headway. 
 Твоє завдання — проаналізувати транзакції конкретного користувача/контрагента і вивести їх у чіткому структурованому форматі.
@@ -663,50 +709,61 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
 1. **Заголовок**: "Аналіз транзакцій [ID користувача/назва]"
 2. **Список транзакцій** (для кожної транзакції окремий пункт):
-   1. **[Тип транзакції]** (наприклад: "Початкова підписка", "Продовження", "Повернення").
+   1. **[Тип транзакції/Статус]** (наприклад: "Початкова підписка", "Продовження", "Refund").
       * **Дата**: YYYY-MM-DD
       * **Сума**: [Сума] [Валюта]
       * **Продукт**: [Назва продукту]
       * **Період**: [Період, якщо є]
-      * **Деталі**: (Платформа, Країна, Статус) - якщо є в даних.
+      * **Деталі**: (Платформа, Країна, Інше) - що є в даних.
       
 3. **Висновки фінансового аналітика** (після списку):
-   * **LTV / Загальні витрати**: Порахуй суму всіх успішних транзакцій.
-   * **Поведінка**: Опиши життєвий цикл (наприклад: "Користувач зайшов через тріал, потім конвертувався...").
-   * **Інше**: Цінова стратегія, географія тощо.
+   * **Загалом**: Порахуй суму (LTV) або загальний обсяг.
+   * **Поведінка**: Опиши життєвий цикл (тріал -> підписка -> скасування тощо).
+   * **Інше**: Цінова стратегія, географія.
 
 Пиши українською мовою. Використовуй Markdown (bold) для ключів.
 """
             else:
-                # --- MODE 2: STANDARD AGGREGATION (Chart + Table + Summary) ---
+                # ВАРІАНТ 2: Стандартна таблиця + графік (для агрегацій)
                 def render_table(df: pd.DataFrame, limit: int = 10) -> str:
-                    df_copy = df.copy()
-                    num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
-                    if num_cols: df_copy = df_copy.sort_values(by=num_cols[0], ascending=False)
-                    df_copy = df_copy.head(limit)
+                    df = df.copy()
+                    num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                    if num_cols:
+                        df = df.sort_values(by=num_cols[0], ascending=False)
+                    df = df.head(limit)
                     for col in num_cols:
-                        df_copy[col] = df_copy[col].round(2).map(lambda x: f"{x:,.2f}".replace(",", " ") if pd.notnull(x) else "")
-                    df_copy = df_copy.astype(str)
-                    col_widths = {col: max(df_copy[col].map(len).max(), len(col)) for col in df_copy.columns}
-                    header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df_copy.columns) + " |"
-                    separator = "|-" + "-|-".join("-" * col_widths[col] for col in df_copy.columns) + "-|"
-                    rows = ["| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df_copy.columns) + " |" for _, row in df_copy.iterrows()]
+                        df[col] = df[col].round(2).map(
+                            lambda x: f"{x:,.2f}".replace(",", " ")
+                            if pd.notnull(x) else ""
+                        )
+                    df = df.astype(str)
+                    col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
+                    header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
+                    separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
+                    rows = []
+                    for _, row in df.iterrows():
+                        rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |")
                     return "\n".join([header, separator] + rows)
 
                 def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
-                    df_copy = df.copy()
-                    num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
-                    if not num_cols: return ""
+                    df = df.copy()
+                    num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                    if not num_cols:
+                        return ""
                     val_col = num_cols[0]
-                    label_cols = [c for c in df_copy.columns if c != val_col and df_copy[c].dtype == object]
-                    label_col = label_cols[0] if label_cols else df_copy.columns[0]
-                    df_copy = df_copy.sort_values(by=val_col, ascending=False).head(limit)
-                    values, labels = df_copy[val_col].fillna(0).tolist(), df_copy[label_col].astype(str).tolist()
-                    max_val = max(values) if values and max(values) > 0 else 1
+                    label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
+                    label_col = label_cols[0] if label_cols else df.columns[0]
+                    df = df.sort_values(by=val_col, ascending=False).head(limit)
+                    values = df[val_col].fillna(0).tolist()
+                    labels = df[label_col].astype(str).tolist()
+                    max_len = 30
+                    max_val = max(values) if max(values) > 0 else 1
                     lines = ["📊 *TOP-10 графік*"]
                     for label, val in zip(labels, values):
-                        bar = "█" * int((val / max_val) * 30)
-                        lines.append(f"{label[:12]:12} | {bar:<30} {val:,.2f}".replace(",", " "))
+                        bar_len = int((val / max_val) * max_len)
+                        bar = "█" * bar_len
+                        val_fmt = f"{val:,.2f}".replace(",", " ")
+                        lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
                     return "\n".join(lines)
 
                 table_md = render_table(df)
@@ -714,14 +771,14 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 final_display = f"```\n{table_md}\n```\n{ascii_md}\n\n"
 
                 analysis_prompt = f"""
-Ти — старший фінансовий аналітик Headway. Твоє завдання — проаналізувати отримані дані та дати чітку, професійну відповідь.
+Ти — старший фінансовий аналітик Headway. Твоє завдання — проаналізувати отримані дані.
 
 Дані (CSV, перші 50 рядків): 
 {data_for_ai}
 
 Запит користувача: "{instruction_part}"
 
-ІНСТРУКЦІЇ (CRITICAL):
+ІНСТРУКЦІЇ:
 1. Обов'язково розрахуй частки (відсотки) та пропорції, якщо це доречно.
 2. Якщо у даних є чітке домінування, обов'язково акцентуй на цьому.
 3. Пиши короткими тезами (буллітами).
@@ -729,32 +786,40 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 5. Дай інсайт, а не просто переказуй цифри.
 """
             
-            try:
-                resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
-                final_response = final_display + resp.text.strip()
-            except Exception as e:
-                if any(k in str(e).lower() for k in ["429", "exhausted", "token"]):
-                    final_response = final_display + TOKEN_LIMIT_MSG
-                else:
-                    final_response = final_display + "\n(Висновок не згенеровано через помилку)"
+            # Генерація відповіді AI
+            resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
+            final_response = final_display + resp.text.strip()
 
     except Exception as e:
         status = "ERROR"
         error_details = str(e)
-        if "🤖 Відповідь AI" in error_details:
+        
+        # Обробка лімітів токенів
+        if any(k in str(error_details).lower() for k in ["429", "exhausted", "token", "quota"]):
+            final_response = (final_display if 'final_display' in locals() else "") + TOKEN_LIMIT_MSG
+            status = "TOKEN_LIMIT"
+        # Обробка текстових відповідей від AI замість SQL
+        elif "🤖 Відповідь AI" in error_details:
             final_response = error_details.replace("ValueError: ", "")
             status = "SUCCESS" 
         else:
             if RETURN_SQL_ON_ERROR and generated_sql:
                 final_response = f"❌ SQL ERROR:\n```sql\n{generated_sql}\n```\n{error_details}"
             else:
-                final_response = f"❌ Помилка при виконанні SQL або аналізу."
+                final_response = f"❌ Помилка при виконанні SQL:\n{error_details}"
 
     finally:
+        end_time = time.time()
+        duration = end_time - start_time
+        
         log_interaction(
-            user_id=user_id, prompt=instruction_part, sql=generated_sql,
-            response=final_response, duration=time.time() - start_time,
-            status=status, error_msg=error_details
+            user_id=user_id,
+            prompt=instruction_part,
+            sql=generated_sql,
+            response=final_response,
+            duration=duration,
+            status=status,
+            error_msg=error_details
         )
 
     return final_response
@@ -764,7 +829,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     queries = split_into_separate_queries(message)
-    # FIX: Більш жорстка фільтрація пустих запитів (довжина > 2)
+    # Фільтрація пустих запитів
     queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
 
     if not queries:
