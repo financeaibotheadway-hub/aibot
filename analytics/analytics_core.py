@@ -130,7 +130,8 @@ def _needs_breakdown(text: str) -> bool:
         "структур", "structure",     
         "розподіл", "distribution",  
         "динамік", "trend",          
-        "legal_entity", "юрсоб"      
+        "legal_entity", "юрсоб",
+        "retained", "new", "тип", "type" # Added explicitly for retained/new breakdown logic
     ]
     t = text.lower()
     return any(k in t for k in keywords)
@@ -425,6 +426,7 @@ def split_into_separate_queries(message: str) -> list:
 
     try:
         current_date_str = datetime.now().strftime('%Y-%m-%d')
+        # UPDATED PROMPT: Added logic to KEEP combination queries together (e.g. which dominates + %)
         prompt = f"""
 Ти — експертний аналітик. Твоє завдання — визначити, чи містить повідомлення користувача ДЕКІЛЬКА РІЗНИХ питань, чи це ОДНЕ складне питання.
 Сьогоднішня дата: {current_date_str}
@@ -432,12 +434,13 @@ def split_into_separate_queries(message: str) -> list:
 ПРАВИЛА (CRITICAL):
 1. НЕ РОЗБИВАЙ запит, якщо частини є уточненнями (фільтри часу, групування, умови).
 2. Фільтри часу ЗАВЖДИ повинні залишатися разом із метрикою.
-3. Инструкції з групування ЗАВЖДИ залишаються в основному запиті.
+3. Якщо друге питання питає про ВІДСОТОК, ЧАСТКУ або СПІВВІДНОШЕННЯ (share, percentage) того, що було в першому — НЕ РОЗБИВАЙ. Це один аналітичний запит.
+4. "Retained vs New" — це ОДИН запит на порівняння.
 
 Повідомлення: "{message}"
 
-Якщо це один запит, поверни його ж.
-Якщо декілька, поверни у форматі:
+Якщо це один запит (або послідовний аналіз), поверни його ж.
+Якщо декілька НЕЗАЛЕЖНИХ, поверни у форматі:
 ЗАПИТ_1: ...
 ЗАПИТ_2: ...
 """
@@ -452,7 +455,9 @@ def split_into_separate_queries(message: str) -> list:
         for ln in lines:
             if ln.startswith("ЗАПИТ_"):
                 q = ln.split(":", 1)[1].strip()
-                out.append(q)
+                # FIX 1: Filter empty strings immediately
+                if q: 
+                    out.append(q)
         return out if out else [message]
     except Exception:
         return [message]
@@ -506,7 +511,7 @@ COST: {json.dumps(cost_schema, indent=2)}
 2. ГРУПУВАННЯ ЧАСУ:
    - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, SELECT `AS week_start`.
    - Обов'язково додай `ORDER BY` для графіків.
-
+   
 3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
    - Якщо "без", "крім", "exclude" -> `AND column != 'value'`.
    - Мапінг країн: "США/USA" -> 'US', "Україна" -> 'UA'.
@@ -516,8 +521,11 @@ COST: {json.dumps(cost_schema, indent=2)}
 
 5. ТРЕНДИ ТА CTE:
    - Запит ПОВИНЕН бути завершеним `SELECT * FROM CTE_NAME`.
+   
+6. НОВІ / ACQUISITION (Якщо питають "які нові з'явились, яких не було"):
+   - Використовуй `WHERE id NOT IN (SELECT id FROM ... WHERE date < start_date)`.
 
-6. ЗАГАЛЬНІ:
+7. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми.
    - Revenue -> `{REVENUE_TABLE_REF}`, Cost -> `{COST_TABLE_REF}`.
    - Trial -> `event_name = 'sale'` AND `product_id LIKE '%trial%'`.
@@ -559,7 +567,7 @@ COST: {json.dumps(cost_schema, indent=2)}
         sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
     
     if metric in {"cost", "opex", "expense", "expenses"} and REVENUE_TABLE_REF in sql:
-         sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
+          sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
 
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
@@ -717,8 +725,15 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     queries = split_into_separate_queries(message)
+    # FIX 2: Explicitly filter out empty/whitespace-only queries
+    queries = [q for q in queries if q.strip()]
+
+    if not queries:
+        return "Не вдалося розпізнати запит."
+
     if len(queries) == 1:
         return execute_single_query(queries[0], smap, user_id)
+        
     out = f"📝 Знайдено {len(queries)} запитів:\n\n"
     for i, q in enumerate(queries, 1):
         ans = execute_single_query(q, smap, user_id)
