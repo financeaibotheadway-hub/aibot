@@ -252,24 +252,29 @@ def _collect_date_columns(schema_list):
     }
 
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
+    # 1. Handle CURRENT_DATE(WithArg) -> quote it
     sql_query = re.sub(
         r"CURRENT_DATE\s*\(\s*([A-Za-z]+\/[A-Za-z_]+)\s*\)",
         r"CURRENT_DATE('\1')",
         sql_query,
         flags=re.IGNORECASE,
     )
+    # 2. Handle empty CURRENT_DATE() -> inject LOCAL_TZ
     sql_query = re.sub(
         r"\bCURRENT_DATE\s*\(\s*\)",
         f"CURRENT_DATE('{LOCAL_TZ}')",
         sql_query,
         flags=re.IGNORECASE,
     )
+    # 3. Handle standalone CURRENT_DATE without parens
     sql_query = re.sub(
         r"\bCURRENT_DATE\b(?!\s*\()",
         f"CURRENT_DATE('{LOCAL_TZ}')",
         sql_query,
         flags=re.IGNORECASE,
     )
+    
+    # 4. Handle PARSE_DATE unwrapping
     for col in date_columns:
         pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
         def _unwrap(m):
@@ -280,6 +285,7 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
             return m.group(0)
         sql_query = re.sub(pattern, _unwrap, sql_query, flags=re.IGNORECASE)
 
+    # 5. Placeholders replacement
     sql_query = re.sub(
         r"'YYYY-MM-DD'",
         f"CURRENT_DATE('{LOCAL_TZ}')",
@@ -306,6 +312,8 @@ def _sanitize_division_by_zero(sql: str) -> str:
         k = f"/*__STR_{len(strings)}__*/"
         strings[k] = m.group(0)
         return k
+    
+    # Protect strings and function calls to avoid replacing inside them
     sql = re.sub(r"'[^']*'", protect, sql)
     sql = re.sub(
         r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
@@ -313,13 +321,16 @@ def _sanitize_division_by_zero(sql: str) -> str:
         sql,
         flags=re.IGNORECASE,
     )
+    
+    # Revert to more robust regex that supports backticks and doesn't rely on \b for boundaries
     sql = re.sub(r"\b[A-Za-z_]+/[A-Za-z_]+\b", protect, sql)
     sql = re.sub(
-        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>\b[\w\.]+\b)\s*/\s*(?P<b>\b[\w\.]+\b)""",
+        r"""(?<!SAFE_DIVIDE\()(?<!SUM\()(?<!AVG\()(?<!COUNT\()(?P<a>[\w\.\`]+)\s*/\s*(?P<b>[\w\.\`]+)""",
         r"SAFE_DIVIDE(\g<a>, \g<b>)",
         sql,
         flags=re.VERBOSE | re.IGNORECASE,
     )
+    
     for k, v in strings.items():
         sql = sql.replace(k, v)
     return sql
