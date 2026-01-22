@@ -643,11 +643,19 @@ COST: {json.dumps(cost_schema, indent=2)}
             raise ValueError("INVALID SQL: revenue table used for cost metric")
 
     # 4. Apply Hard Filters
+    
+    # FIX: Check if user wants to EXCLUDE this event type (e.g. "without refunds")
+    skip_event_filter = False
+    if re.search(r"\b(без|крім|exclude|excluding|without|виключити|прибрати|net)\b", instruction_part.lower()):
+        skip_event_filter = True
+
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
-            if f"event_type = '{event_type}'" not in sql.lower():
-                sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+            # Якщо це запит на виключення, не додаємо жорсткий фільтр
+            if not skip_event_filter:
+                if f"event_type = '{event_type}'" not in sql.lower():
+                    sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
