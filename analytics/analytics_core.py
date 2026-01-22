@@ -63,7 +63,7 @@ try:
 except Exception:
     logger.warning("Vertex init failed", exc_info=True)
 
-model = GenerativeModel("gemini-2.5-flash")
+model = GenerativeModel("gemini-2.0-flash-exp")
 
 query_cache = {}
 cache_ttl = 300
@@ -162,23 +162,15 @@ def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     sql_lower = sql.lower()
     if condition_sql.lower() in sql_lower:
         return sql
+    
+    pattern = r"(\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|$)"
+    
     if " where " in f" {sql_lower} ":
-        return re.sub(
-            r"\bwhere\b",
-            f"WHERE {condition_sql} AND",
-            sql,
-            flags=re.IGNORECASE,
-            count=1,
-        )
-    return re.sub(
-        r"(\bfrom\b\s+`?[\w\-\.:]+`?)",
-        r"\1 WHERE " + condition_sql,
-        sql,
-        flags=re.IGNORECASE,
-        count=1,
-    )
+        return re.sub(r"\bwhere\b", f"WHERE {condition_sql} AND", sql, flags=re.IGNORECASE, count=1)
+    else:
+        # Тут важливо використовувати \1 щоб повернути знайдене слово (наприклад GROUP BY) на місце
+        return re.sub(pattern, rf" WHERE {condition_sql} \1", sql, flags=re.IGNORECASE, count=1).strip()
 
-# >>> preload schemas
 _ = get_all_schemas()
 
 
