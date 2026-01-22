@@ -63,7 +63,7 @@ try:
 except Exception:
     logger.warning("Vertex init failed", exc_info=True)
 
-model = GenerativeModel("gemini-2.0-flash-exp")
+model = GenerativeModel("gemini-1.5-flash")
 
 query_cache = {}
 cache_ttl = 300
