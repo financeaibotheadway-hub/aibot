@@ -35,7 +35,7 @@ BQ_DATASET         = os.getenv("BQ_DATASET", "uploads")
 BQ_REVENUE_TABLE   = os.getenv("BQ_REVENUE_TABLE", "revenue_test_databot")
 BQ_COST_TABLE      = os.getenv("BQ_COST_TABLE", "cost_test_databot")
 VERTEX_LOCATION    = os.getenv("VERTEX_LOCATION", "europe-west1")
-LOCAL_TZ          = os.getenv("LOCAL_TZ", "Europe/Kyiv")
+LOCAL_TZ           = os.getenv("LOCAL_TZ", "Europe/Kyiv")
 
 BQ_LOG_TABLE       = os.getenv("BQ_LOG_TABLE", f"{BQ_PROJECT}.{BQ_DATASET}.bot_logs")
 
@@ -63,7 +63,7 @@ try:
 except Exception:
     logger.warning("Vertex init failed", exc_info=True)
 
-model = GenerativeModel("gemini-2.0-flash") # Оновлено до актуальної версії flash
+model = GenerativeModel("gemini-2.0-flash") 
 
 query_cache = {}
 cache_ttl = 300
@@ -161,34 +161,27 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     """
     Додає умову в SQL, перевіряючи чи вже існує блок WHERE.
+    Покращено для уникнення помилок у складних запитах.
     """
     sql_lower = sql.lower()
     if condition_sql.lower() in sql_lower:
         return sql
 
-    # Регулярка для пошуку першого блоку FROM таблиця
-    # Враховує назви з кавичками та префіксами проектів
-    from_pattern = r"(\bfrom\b\s+`?[\w\-\.:]+`?)"
+    # Патерн для знаходження WHERE як окремого слова (не в назвах таблиць)
+    where_match = re.search(r"\bwhere\b", sql_lower)
     
-    # Перевіряємо, чи є WHERE саме після блоку FROM (спрощено)
-    if " where " in f" {sql_lower} ":
-        # Якщо WHERE вже є, додаємо нашу умову як першу через AND
-        return re.sub(
-            r"\bwhere\b",
-            f"WHERE {condition_sql} AND",
-            sql,
-            flags=re.IGNORECASE,
-            count=1,
-        )
+    if where_match:
+        # Додаємо умову відразу після WHERE
+        idx = where_match.start()
+        return sql[:idx+5] + f" {condition_sql} AND " + sql[idx+5:]
     else:
-        # Якщо WHERE немає, додаємо його після FROM
-        return re.sub(
-            from_pattern,
-            r"\1 WHERE " + condition_sql,
-            sql,
-            flags=re.IGNORECASE,
-            count=1,
-        )
+        # Якщо WHERE немає, шукаємо останній FROM (найчастіше це головна таблиця в простих запитах)
+        # Або перший FROM для CTE. Тут використовуємо логіку після першого знайденого FROM таблиці.
+        from_pattern = r"(\bfrom\b\s+`?[\w\-\.:]+`?)"
+        match = re.search(from_pattern, sql, flags=re.IGNORECASE)
+        if match:
+            return re.sub(from_pattern, r"\1 WHERE " + condition_sql, sql, flags=re.IGNORECASE, count=1)
+        return sql
 
 # >>> preload schemas
 _ = get_all_schemas()
@@ -534,14 +527,14 @@ COST: {json.dumps(cost_schema, indent=2)}
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     
-    # ПРАВКА: Очищення SQL перед трансформаціями
-    sql = sql.replace("```sql", "").replace("```", "").strip()
+    # ПРАВКА: Більш агресивне очищення SQL
+    sql = re.sub(r"```sql|```", "", sql).strip()
 
     match = re.search(r"(SELECT|WITH)\s.*", sql, re.IGNORECASE | re.DOTALL)
     if match:
         sql = match.group(0)
         
-    # ПРАВКА: Послідовні санітайзери (тільки один раз!)
+    # ПРАВКА: Послідовні санітайзери
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
@@ -562,15 +555,15 @@ COST: {json.dumps(cost_schema, indent=2)}
         return f"SELECT SUM(ABS(amount_lcy)) AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
 
     if account_no is not None and REVENUE_TABLE_REF in sql:
-        raise ValueError("INVALID SQL: revenue table used for account-based cost query")
+        # Спроба пофіксити, якщо AI помилився таблицею для аккаунтів
+        sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
     
     if metric in {"cost", "opex", "expense", "expenses"} and REVENUE_TABLE_REF in sql:
-        raise ValueError("INVALID SQL: revenue table used for cost metric")
+         sql = sql.replace(f"`{REVENUE_TABLE_REF}`", f"`{COST_TABLE_REF}`")
 
     event_type = detect_event_type(instruction_part)
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
-            # Виправлена логіка додавання WHERE через _ensure_where_filter
             sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
@@ -598,8 +591,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 
     TOKEN_LIMIT_MSG = (
         "⚠️ **Обмеження контексту (Token Limit Exceeded)**\n\n"
-        "Ми зіткнулися з обмеженням контекстного вікна при роботі у довгих тредах Slack. "
-        "Як рішення, ми рекомендуємо розбивати різні аналітичні задачі на окремі треди."
+        "Ми зіткнулися з обмеженням контекстного вікна. "
+        "Спробуйте розбити запит на менші частини або скоротити період."
     )
 
     try:
@@ -637,28 +630,28 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 df = df.rename(columns={df.columns[0]: "value"})
 
             def render_table(df: pd.DataFrame, limit: int = 10) -> str:
-                df = df.copy()
-                num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-                if num_cols: df = df.sort_values(by=num_cols[0], ascending=False)
-                df = df.head(limit)
+                df_copy = df.copy()
+                num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
+                if num_cols: df_copy = df_copy.sort_values(by=num_cols[0], ascending=False)
+                df_copy = df_copy.head(limit)
                 for col in num_cols:
-                    df[col] = df[col].round(2).map(lambda x: f"{x:,.2f}".replace(",", " ") if pd.notnull(x) else "")
-                df = df.astype(str)
-                col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
-                header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
-                separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
-                rows = ["| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |" for _, row in df.iterrows()]
+                    df_copy[col] = df_copy[col].round(2).map(lambda x: f"{x:,.2f}".replace(",", " ") if pd.notnull(x) else "")
+                df_copy = df_copy.astype(str)
+                col_widths = {col: max(df_copy[col].map(len).max(), len(col)) for col in df_copy.columns}
+                header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df_copy.columns) + " |"
+                separator = "|-" + "-|-".join("-" * col_widths[col] for col in df_copy.columns) + "-|"
+                rows = ["| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df_copy.columns) + " |" for _, row in df_copy.iterrows()]
                 return "\n".join([header, separator] + rows)
 
             def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
-                df = df.copy()
-                num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
+                df_copy = df.copy()
+                num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
                 if not num_cols: return ""
                 val_col = num_cols[0]
-                label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
-                label_col = label_cols[0] if label_cols else df.columns[0]
-                df = df.sort_values(by=val_col, ascending=False).head(limit)
-                values, labels = df[val_col].fillna(0).tolist(), df[label_col].astype(str).tolist()
+                label_cols = [c for c in df_copy.columns if c != val_col and df_copy[c].dtype == object]
+                label_col = label_cols[0] if label_cols else df_copy.columns[0]
+                df_copy = df_copy.sort_values(by=val_col, ascending=False).head(limit)
+                values, labels = df_copy[val_col].fillna(0).tolist(), df_copy[label_col].astype(str).tolist()
                 max_val = max(values) if values and max(values) > 0 else 1
                 lines = ["📊 *TOP-10 графік*"]
                 for label, val in zip(labels, values):
@@ -670,21 +663,23 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             ascii_md = render_ascii_chart(df)
             final_display = f"```\n{table_md}\n```\n{ascii_md}"
 
-            # >>> ФІКС: Оновлений промпт для професійного аналізу
+            # ПРАВКА: Лімітуємо дані для аналізу (head 50), щоб не впасти по токенах
+            data_for_ai = df.head(50).to_csv(index=False)
+
             analysis_prompt = f"""
 Ти — старший фінансовий аналітик Headway. Твоє завдання — проаналізувати отримані дані та дати чітку, професійну відповідь.
 
-Дані (CSV): 
-{df.to_csv(index=False)}
+Дані (CSV, перші 50 рядків): 
+{data_for_ai}
 
 Запит користувача: "{instruction_part}"
 
 ІНСТРУКЦІЇ (CRITICAL):
-1. Обов'язково розрахуй частки (відсотки) та пропорції, якщо це доречно (наприклад, Retained vs New).
-2. Якщо у даних є чітке домінування (наприклад, частка становить 84%), обов'язково акцентуй на цьому.
-3. Пиши короткими тезами (буллітами), використовуючи впевнений діловий тон.
+1. Обов'язково розрахуй частки (відсотки) та пропорції, якщо це доречно.
+2. Якщо у даних є чітке домінування, обов'язково акцентуй на цьому.
+3. Пиши короткими тезами (буллітами).
 4. Якщо бачиш аномалії або важливі тренди — виділи їх окремо.
-5. Не просто переказуй цифри, а дай інсайт (який тип доходу переважає, наскільки значним є відрив).
+5. Дай інсайт, а не просто переказуй цифри.
 """
             
             try:
@@ -694,7 +689,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 if any(k in str(e).lower() for k in ["429", "exhausted", "token"]):
                     final_response = final_display + "\n\n" + TOKEN_LIMIT_MSG
                 else:
-                    final_response = final_display + "\n\n(Висновок не згенеровано)"
+                    final_response = final_display + "\n\n(Висновок не згенеровано через помилку)"
 
     except Exception as e:
         status = "ERROR"
@@ -706,7 +701,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if RETURN_SQL_ON_ERROR and generated_sql:
                 final_response = f"❌ SQL ERROR:\n```sql\n{generated_sql}\n```\n{error_details}"
             else:
-                final_response = f"❌ Помилка при виконанні SQL:\n{error_details}"
+                final_response = f"❌ Помилка при виконанні SQL або аналізу."
 
     finally:
         log_interaction(
