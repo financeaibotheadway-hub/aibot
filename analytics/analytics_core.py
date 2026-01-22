@@ -630,43 +630,90 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
-            def render_table(df: pd.DataFrame, limit: int = 10) -> str:
-                df_copy = df.copy()
-                num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
-                if num_cols: df_copy = df_copy.sort_values(by=num_cols[0], ascending=False)
-                df_copy = df_copy.head(limit)
-                for col in num_cols:
-                    df_copy[col] = df_copy[col].round(2).map(lambda x: f"{x:,.2f}".replace(",", " ") if pd.notnull(x) else "")
-                df_copy = df_copy.astype(str)
-                col_widths = {col: max(df_copy[col].map(len).max(), len(col)) for col in df_copy.columns}
-                header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df_copy.columns) + " |"
-                separator = "|-" + "-|-".join("-" * col_widths[col] for col in df_copy.columns) + "-|"
-                rows = ["| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df_copy.columns) + " |" for _, row in df_copy.iterrows()]
-                return "\n".join([header, separator] + rows)
+            # -- DETECTION OF TRANSACTION LIST --
+            # If the data looks like a raw transaction list for a specific entity (user/account),
+            # we want a detailed textual breakdown instead of a giant ASCII table.
+            
+            is_detailed_transaction_list = False
+            col_names = [c.lower() for c in df.columns]
+            has_user_id = any(x in col_names for x in ['user_id', 'email', 'account_no', 'customer_id'])
+            has_date = any(x in col_names for x in ['date', 'order_date', 'transaction_date', 'event_date', 'posting_date'])
+            # Threshold: less than 30 rows (to avoid hitting token limits with large lists)
+            if has_user_id and has_date and len(df) < 30 and len(df) > 0:
+                is_detailed_transaction_list = True
 
-            def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
-                df_copy = df.copy()
-                num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
-                if not num_cols: return ""
-                val_col = num_cols[0]
-                label_cols = [c for c in df_copy.columns if c != val_col and df_copy[c].dtype == object]
-                label_col = label_cols[0] if label_cols else df_copy.columns[0]
-                df_copy = df_copy.sort_values(by=val_col, ascending=False).head(limit)
-                values, labels = df_copy[val_col].fillna(0).tolist(), df_copy[label_col].astype(str).tolist()
-                max_val = max(values) if values and max(values) > 0 else 1
-                lines = ["📊 *TOP-10 графік*"]
-                for label, val in zip(labels, values):
-                    bar = "█" * int((val / max_val) * 30)
-                    lines.append(f"{label[:12]:12} | {bar:<30} {val:,.2f}".replace(",", " "))
-                return "\n".join(lines)
-
-            table_md = render_table(df)
-            ascii_md = render_ascii_chart(df)
-            final_display = f"```\n{table_md}\n```\n{ascii_md}"
-
+            final_display = ""
+            analysis_prompt = ""
             data_for_ai = df.head(50).to_csv(index=False)
 
-            analysis_prompt = f"""
+            if is_detailed_transaction_list:
+                # --- MODE 1: DETAILED TEXTUAL BREAKDOWN (No ASCII Table) ---
+                # This matches the user request for "Screens 2, 3, 4" style
+                analysis_prompt = f"""
+Ти — старший фінансовий аналітик Headway. 
+Твоє завдання — проаналізувати транзакції конкретного користувача/контрагента і вивести їх у чіткому структурованому форматі.
+
+Дані (CSV): 
+{data_for_ai}
+
+Запит користувача: "{instruction_part}"
+
+ФОРМАТ ВІДПОВІДІ (CRITICAL):
+Не малюй таблицю. Виведи нумерований список транзакцій з аналізом.
+
+1. **Заголовок**: "Аналіз транзакцій [ID користувача/назва]"
+2. **Список транзакцій** (для кожної транзакції окремий пункт):
+   1. **[Тип транзакції]** (наприклад: "Початкова підписка", "Продовження", "Повернення").
+      * **Дата**: YYYY-MM-DD
+      * **Сума**: [Сума] [Валюта]
+      * **Продукт**: [Назва продукту]
+      * **Період**: [Період, якщо є]
+      * **Деталі**: (Платформа, Країна, Статус) - якщо є в даних.
+      
+3. **Висновки фінансового аналітика** (після списку):
+   * **LTV / Загальні витрати**: Порахуй суму всіх успішних транзакцій.
+   * **Поведінка**: Опиши життєвий цикл (наприклад: "Користувач зайшов через тріал, потім конвертувався...").
+   * **Інше**: Цінова стратегія, географія тощо.
+
+Пиши українською мовою. Використовуй Markdown (bold) для ключів.
+"""
+            else:
+                # --- MODE 2: STANDARD AGGREGATION (Chart + Table + Summary) ---
+                def render_table(df: pd.DataFrame, limit: int = 10) -> str:
+                    df_copy = df.copy()
+                    num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
+                    if num_cols: df_copy = df_copy.sort_values(by=num_cols[0], ascending=False)
+                    df_copy = df_copy.head(limit)
+                    for col in num_cols:
+                        df_copy[col] = df_copy[col].round(2).map(lambda x: f"{x:,.2f}".replace(",", " ") if pd.notnull(x) else "")
+                    df_copy = df_copy.astype(str)
+                    col_widths = {col: max(df_copy[col].map(len).max(), len(col)) for col in df_copy.columns}
+                    header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df_copy.columns) + " |"
+                    separator = "|-" + "-|-".join("-" * col_widths[col] for col in df_copy.columns) + "-|"
+                    rows = ["| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df_copy.columns) + " |" for _, row in df_copy.iterrows()]
+                    return "\n".join([header, separator] + rows)
+
+                def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
+                    df_copy = df.copy()
+                    num_cols = df_copy.select_dtypes(include=["number"]).columns.tolist()
+                    if not num_cols: return ""
+                    val_col = num_cols[0]
+                    label_cols = [c for c in df_copy.columns if c != val_col and df_copy[c].dtype == object]
+                    label_col = label_cols[0] if label_cols else df_copy.columns[0]
+                    df_copy = df_copy.sort_values(by=val_col, ascending=False).head(limit)
+                    values, labels = df_copy[val_col].fillna(0).tolist(), df_copy[label_col].astype(str).tolist()
+                    max_val = max(values) if values and max(values) > 0 else 1
+                    lines = ["📊 *TOP-10 графік*"]
+                    for label, val in zip(labels, values):
+                        bar = "█" * int((val / max_val) * 30)
+                        lines.append(f"{label[:12]:12} | {bar:<30} {val:,.2f}".replace(",", " "))
+                    return "\n".join(lines)
+
+                table_md = render_table(df)
+                ascii_md = render_ascii_chart(df)
+                final_display = f"```\n{table_md}\n```\n{ascii_md}\n\n"
+
+                analysis_prompt = f"""
 Ти — старший фінансовий аналітик Headway. Твоє завдання — проаналізувати отримані дані та дати чітку, професійну відповідь.
 
 Дані (CSV, перші 50 рядків): 
@@ -684,12 +731,12 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             
             try:
                 resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
-                final_response = final_display + "\n\n" + resp.text.strip()
+                final_response = final_display + resp.text.strip()
             except Exception as e:
                 if any(k in str(e).lower() for k in ["429", "exhausted", "token"]):
-                    final_response = final_display + "\n\n" + TOKEN_LIMIT_MSG
+                    final_response = final_display + TOKEN_LIMIT_MSG
                 else:
-                    final_response = final_display + "\n\n(Висновок не згенеровано через помилку)"
+                    final_response = final_display + "\n(Висновок не згенеровано через помилку)"
 
     except Exception as e:
         status = "ERROR"
