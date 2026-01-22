@@ -179,18 +179,10 @@ def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     
     if where_match:
         # Вставляємо одразу після WHERE
-        # Використовуємо replace, щоб зберегти регістр оригінального запиту
-        # Але треба бути обережним, замінюємо лише перше входження WHERE
         pattern = re.compile(r"\bwhere\b", re.IGNORECASE)
         return pattern.sub(f"WHERE {condition_sql} AND", sql, count=1)
     else:
-        # Шукаємо FROM ... TABLE ...
-        # І вставляємо WHERE перед GROUP BY, ORDER BY, LIMIT, WINDOW, HAVING або кінцем рядка
-        # Pattern: find FROM clause, then lookahead for keywords or EOS
-        
-        # Спрощений підхід: знаходимо FROM і кінець назви таблиці
-        # Потім вставляємо WHERE.
-        # Але найбезпечніше: знайти ключові слова, які мають йти ПІСЛЯ where
+        # Шукаємо ключові слова, які мають йти ПІСЛЯ where
         keywords_pattern = r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|WINDOW|HAVING|UNION)\b"
         match = re.search(keywords_pattern, sql, re.IGNORECASE)
         
@@ -200,7 +192,6 @@ def _ensure_where_filter(sql: str, condition_sql: str) -> str:
             return sql[:idx] + f" WHERE {condition_sql} " + sql[idx:]
         else:
             # Якщо немає GROUP/ORDER/LIMIT, просто додаємо в кінець (але після FROM)
-            # Перевіряємо, чи є FROM (може бути просто SELECT 1)
             if "FROM" in sql_upper:
                 return sql + f" WHERE {condition_sql}"
             
@@ -337,7 +328,7 @@ def _sanitize_division_by_zero(sql: str) -> str:
         strings[k] = m.group(0)
         return k
     
-    # Protect strings and function calls to avoid replacing inside them
+    # Protect strings and function calls
     sql = re.sub(r"'[^']*'", protect, sql)
     sql = re.sub(
         r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
@@ -346,19 +337,8 @@ def _sanitize_division_by_zero(sql: str) -> str:
         flags=re.IGNORECASE,
     )
     
-    # Fix for "Double function call parentheses" and "Syntax Error"
-    # Only replace a / b when a and b are simple alphanumeric identifiers (or dot/tick).
-    # Do NOT replace if it looks like a function call `SUM(...) / ...` or `... / count(...)`
-    # because that's where regex usually fails.
-    
-    # Simple, safer regex: match `word / word` or `word.word / word`
-    # We use \b to ensure boundaries.
-    
-    # This regex looks for:
-    # (word or `word` or word.word) / (word or `word` or word.word)
-    # It deliberately ignores anything with parens () to avoid breaking function calls.
-    
-    safe_div_pattern =_regex = r"""
+    # Safer regex: match `word / word` or `word.word / word`
+    safe_div_pattern = r"""
         (?P<a>\b[`a-zA-Z0-9_\.]+\b)   # Numerator: simple identifier
         \s*/\s*                       # Division operator
         (?P<b>\b[`a-zA-Z0-9_\.]+\b)   # Denominator: simple identifier
@@ -837,9 +817,11 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
 ІНСТРУКЦІЇ:
 1. Обов'язково розрахуй частки (відсотки) та пропорції, якщо це доречно.
 2. Якщо у даних є чітке домінування, обов'язково акцентуй на цьому.
-3. Пиши короткими тезами (буллітами).
-4. Якщо бачиш аномалії або важливі тренди — виділи їх окремо.
-5. Дай інсайт, а не просто переказуй цифри.
+3. Якщо результат SQL є єдиним числом або рядком (наприклад, конкретна дата або сума), ВВАЖАЙ ЦЕ КІНЦЕВОЮ ВІДПОВІДДЮ. Не пиши "недостатньо даних", якщо SQL вже відфільтрував потрібне.
+4. Оформлення:
+   - Використовуй Emoji (🎯 для відповіді, 📊 для деталей, 💡 для інсайтів).
+   - Використовуй > Blockquotes для головних висновків.
+   - Замість списків точками, розбивай на логічні блочки з жирними заголовками.
 """
             
             # Генерація відповіді AI
