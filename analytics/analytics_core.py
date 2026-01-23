@@ -178,6 +178,7 @@ def get_database_values_context():
         return _values_cache
 
     # Список колонок, для яких ми хочемо знати реальні значення в базі
+    # Це допомагає боту знати, що 'US' це 'US', а не 'USA'
     cols_to_scan = {
         REVENUE_TABLE_REF: ["app_name", "geo_country", "platform", "revenue_type", "event_type"],
         COST_TABLE_REF:    ["costrev_center_code", "account_name", "legal_entity"]
@@ -193,6 +194,9 @@ def get_database_values_context():
         if not valid_cols:
             continue
 
+        # Будуємо легкий запит через APPROX_TOP_COUNT (дешевше і швидше ніж DISTINCT)
+        # або просто LIMIT, якщо APPROX не підтримується для типу.
+        # Для простоти беремо DISTINCT з лімітом.
         try:
             for col in valid_cols:
                 sql = f"SELECT DISTINCT {col} FROM `{table}` WHERE {col} IS NOT NULL LIMIT 15"
@@ -211,24 +215,32 @@ def get_database_values_context():
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     """
     Розумне додавання WHERE.
+    1. Якщо WHERE вже є -> додаємо AND ...
+    2. Якщо WHERE немає -> вставляємо WHERE після FROM, але ПЕРЕД GROUP BY/ORDER BY/LIMIT.
     """
     sql_upper = sql.upper()
+    
+    # Якщо умова вже є (груба перевірка)
     if condition_sql.upper() in sql_upper:
         return sql
 
+    # Перевіряємо наявність WHERE
     where_match = re.search(r"\bWHERE\b", sql_upper)
+    
     if where_match:
         pattern = re.compile(r"\bwhere\b", re.IGNORECASE)
         return pattern.sub(f"WHERE {condition_sql} AND", sql, count=1)
     else:
         keywords_pattern = r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|WINDOW|HAVING|UNION)\b"
         match = re.search(keywords_pattern, sql, re.IGNORECASE)
+        
         if match:
             idx = match.start()
             return sql[:idx] + f" WHERE {condition_sql} " + sql[idx:]
         else:
             if "FROM" in sql_upper:
                 return sql + f" WHERE {condition_sql}"
+            
     return sql
 
 # >>> preload schemas
@@ -239,9 +251,11 @@ _ = get_all_schemas()
 # BIGQUERY LOGGING LOGIC
 # ──────────────────────────────────────────────────────────────────────────────
 def _ensure_log_table_exists():
+    """Створює таблицю логів, якщо її не існує"""
     global _log_table_checked
     if _log_table_checked:
         return
+
     try:
         bq_client.get_table(BQ_LOG_TABLE)
         _log_table_checked = True
@@ -266,7 +280,9 @@ def _ensure_log_table_exists():
             logger.error(f"Failed to create log table: {e}")
 
 def log_interaction(user_id, prompt, sql, response, duration, status, error_msg=None):
+    """Записує лог в BigQuery"""
     _ensure_log_table_exists()
+
     try:
         rows = [{
             "event_timestamp": datetime.now().isoformat(),
@@ -278,6 +294,7 @@ def log_interaction(user_id, prompt, sql, response, duration, status, error_msg=
             "status": status,
             "error_message": str(error_msg) if error_msg else None
         }]
+        
         errors = bq_client.insert_rows_json(BQ_LOG_TABLE, rows)
         if errors:
             logger.error(f"BQ Logging errors: {errors}")
@@ -296,10 +313,29 @@ def _collect_date_columns(schema_list):
     }
 
 def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
-    sql_query = re.sub(r"CURRENT_DATE\s*\(\s*([A-Za-z]+\/[A-Za-z_]+)\s*\)", r"CURRENT_DATE('\1')", sql_query, flags=re.IGNORECASE)
-    sql_query = re.sub(r"\bCURRENT_DATE\s*\(\s*\)", f"CURRENT_DATE('{LOCAL_TZ}')", sql_query, flags=re.IGNORECASE)
-    sql_query = re.sub(r"\bCURRENT_DATE\b(?!\s*\()", f"CURRENT_DATE('{LOCAL_TZ}')", sql_query, flags=re.IGNORECASE)
+    # 1. Handle CURRENT_DATE(WithArg) -> quote it
+    sql_query = re.sub(
+        r"CURRENT_DATE\s*\(\s*([A-Za-z]+\/[A-Za-z_]+)\s*\)",
+        r"CURRENT_DATE('\1')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+    # 2. Handle empty CURRENT_DATE() -> inject LOCAL_TZ
+    sql_query = re.sub(
+        r"\bCURRENT_DATE\s*\(\s*\)",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+    # 3. Handle standalone CURRENT_DATE without parens
+    sql_query = re.sub(
+        r"\bCURRENT_DATE\b(?!\s*\()",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
     
+    # 4. Handle PARSE_DATE unwrapping
     for col in date_columns:
         pattern = rf"PARSE_DATE\(\s*'[^']+'\s*,\s*(`?[\w\.]+`?)\s*\)"
         def _unwrap(m):
@@ -310,9 +346,25 @@ def _sanitize_sql_dates(sql_query: str, date_columns: set) -> str:
             return m.group(0)
         sql_query = re.sub(pattern, _unwrap, sql_query, flags=re.IGNORECASE)
 
-    sql_query = re.sub(r"'YYYY-MM-DD'", f"CURRENT_DATE('{LOCAL_TZ}')", sql_query, flags=re.IGNORECASE)
-    sql_query = re.sub(r"'YYYY-MM-01'", f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)", sql_query, flags=re.IGNORECASE)
-    sql_query = re.sub(r"'YYYY-MM-31'", f"LAST_DAY(CURRENT_DATE('{LOCAL_TZ}'))", sql_query, flags=re.IGNORECASE)
+    # 5. Placeholders replacement
+    sql_query = re.sub(
+        r"'YYYY-MM-DD'",
+        f"CURRENT_DATE('{LOCAL_TZ}')",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+    sql_query = re.sub(
+        r"'YYYY-MM-01'",
+        f"DATE_TRUNC(CURRENT_DATE('{LOCAL_TZ}'), MONTH)",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
+    sql_query = re.sub(
+        r"'YYYY-MM-31'",
+        f"LAST_DAY(CURRENT_DATE('{LOCAL_TZ}'))",
+        sql_query,
+        flags=re.IGNORECASE,
+    )
     return sql_query
 
 def _sanitize_division_by_zero(sql: str) -> str:
@@ -322,18 +374,38 @@ def _sanitize_division_by_zero(sql: str) -> str:
         strings[k] = m.group(0)
         return k
     
+    # Protect strings and function calls
     sql = re.sub(r"'[^']*'", protect, sql)
-    sql = re.sub(r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)", protect, sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        r"\b(CURRENT_DATE|DATE|DATETIME|TIMESTAMP)\s*\([^)]*\)",
+        protect,
+        sql,
+        flags=re.IGNORECASE,
+    )
     
-    safe_div_pattern = r"""(?P<a>\b[`a-zA-Z0-9_\.]+\b)\s*/\s*(?P<b>\b[`a-zA-Z0-9_\.]+\b)"""
-    sql = re.sub(safe_div_pattern, r"SAFE_DIVIDE(\g<a>, \g<b>)", sql, flags=re.VERBOSE | re.IGNORECASE)
+    # Safer regex
+    safe_div_pattern = r"""
+        (?P<a>\b[`a-zA-Z0-9_\.]+\b)   # Numerator
+        \s*/\s*                       # Division operator
+        (?P<b>\b[`a-zA-Z0-9_\.]+\b)   # Denominator
+    """
+    
+    sql = re.sub(
+        safe_div_pattern,
+        r"SAFE_DIVIDE(\g<a>, \g<b>)",
+        sql,
+        flags=re.VERBOSE | re.IGNORECASE,
+    )
     
     for k, v in strings.items():
         sql = sql.replace(k, v)
     return sql
 
 def fix_window_order_by(sql: str) -> str:
-    pattern = re.compile(r"""(?P<fn>\b(?:LAG|LEAD)\s*\(.*?\))\s*OVER\s*\((?P<inside>[^)]*)\)""", re.IGNORECASE | re.DOTALL | re.VERBOSE)
+    pattern = re.compile(
+        r"""(?P<fn>\b(?:LAG|LEAD)\s*\(.*?\))\s*OVER\s*\((?P<inside>[^)]*)\)""",
+        re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
     def _add_order_by(m: re.Match) -> str:
         fn = m.group("fn")
         inside = m.group("inside")
@@ -344,14 +416,31 @@ def fix_window_order_by(sql: str) -> str:
     return pattern.sub(_add_order_by, sql)
 
 def requires_date_range(text: str) -> bool:
-    keywords = ["збільш", "зменш", "вирос", "впав", "increase", "decrease", "grow", "drop", "динамік", "тренд", "trend", "порівня", "compare", "чи більше", "чи менше"]
-    return any(k in text.lower() for k in keywords)
+    keywords = [
+        "збільш", "зменш", "вирос", "впав",
+        "increase", "decrease", "grow", "drop",
+        "динамік", "тренд", "trend",
+        "порівня", "compare",
+        "чи більше", "чи менше",
+        "has increased", "has decreased"
+    ]
+    t = text.lower()
+    return any(k in t for k in keywords)
 
 def has_explicit_date(text: str) -> bool:
-    return bool(re.search(r"\b(20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|січ|лют|бер|кві|тра|чер|лип|сер|вер|жов|лис|гру|місяц|квартал|рік|from|to|between|до|від)\b", text.lower()))
+    return bool(re.search(
+        r"\b(20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+        r"січ|лют|бер|кві|тра|чер|лип|сер|вер|жов|лис|гру|"
+        r"місяц|квартал|рік|"
+        r"from|to|between|до|від)\b",
+        text.lower()
+    ))
     
 def is_trend_question(text: str) -> bool:
-    return bool(re.search(r"(рост|пад|зрост|зменш|динамік|trend|increase|decrease).*(чи|\?|vs|порівня)", text.lower()))
+    return bool(re.search(
+        r"(рост|пад|зрост|зменш|динамік|trend|increase|decrease).*(чи|\?|vs|порівня)",
+        text.lower()
+    ))
 
 def execute_cached_query(sql_query: str):
     cache_key = get_cache_key(sql_query)
@@ -377,7 +466,8 @@ def find_matches_with_ai_cached(instruction: str, smap_json: str):
     try:
         resp = model.generate_content(prompt, generation_config={"temperature": 0})
         txt = resp.text.strip()
-        if txt == "NONE": return []
+        if txt == "NONE":
+            return []
         out = []
         for part in txt.split(","):
             if ":" in part:
@@ -396,14 +486,23 @@ def find_matches_with_ai(instruction, smap):
 # ──────────────────────────────────────────────────────────────────────────────
 def _has_filter_only_tail(text: str) -> bool:
     t = text.lower()
-    filter_patterns = [r"за\s+контрагентом\s+\w+", r"по\s+контрагенту\s+\w+", r"by\s+vendor\s+\w+", r"for\s+vendor\s+\w+"]
-    return any(re.search(p, t) for p in filter_patterns) and not re.search(r"\b(і|та|also|and)\b", t)
+    filter_patterns = [
+        r"за\s+контрагентом\s+\w+",
+        r"по\s+контрагенту\s+\w+",
+        r"by\s+vendor\s+\w+",
+        r"for\s+vendor\s+\w+",
+    ]
+    has_filter = any(re.search(p, t) for p in filter_patterns)
+    has_split_words = re.search(r"\b(і|та|also|and)\b", t)
+    return has_filter and not has_split_words
     
 def split_into_separate_queries(message: str) -> list:
     if extract_account_no(message) is not None and not is_trend_question(message):
         return [message]
+
     if _has_filter_only_tail(message):
         return [message]
+
     try:
         current_date_str = datetime.now().strftime('%Y-%m-%d')
         prompt = f"""
@@ -412,7 +511,10 @@ def split_into_separate_queries(message: str) -> list:
 
 ПРАВИЛА (CRITICAL):
 1. НЕ РОЗБИВАЙ запит, якщо частини є уточненнями (фільтри часу, групування, умови).
-2. Фільтри часу ЗАВЖДИ повинні залишатися разом із метрикою.
+   - "Покажи дохід за останні 3 місяці потижнево" -> ЦЕ ОДИН ЗАПИТ. (Тут є метрика + час + групування).
+   - "Який дохід у травні та який у червні" -> ЦЕ ДВА ЗАПИТИ.
+   - "Дохід по країнах за 2024 рік" -> ЦЕ ОДИН ЗАПИТ.
+2. Фільтри часу ("останні 3 місяці", "вчора", "минулого тижня") ЗАВЖДИ повинні залишатися разом із метрикою, до якої вони відносяться.
 3. Інструкції з групування ("потижнево", "по центрах", "weekly") ЗАВЖДИ залишаються в основному запиті.
 
 Повідомлення: "{message}"
@@ -424,7 +526,10 @@ def split_into_separate_queries(message: str) -> list:
 """
         resp = model.generate_content(prompt, generation_config={"temperature": 0})
         text_resp = resp.text.strip()
-        if "ЗАПИТ_" not in text_resp: return [message]
+        
+        if "ЗАПИТ_" not in text_resp:
+             return [message]
+
         lines = text_resp.split("\n")
         out = []
         for ln in lines:
@@ -503,8 +608,6 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
    - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
    - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
-   - УВАГА: Якщо питають "вартість офісу" або "оренда офісу" (office rent/cost), це часто означає ВЕСЬ кост-центр офісу (`costrev_center_code LIKE '%office%'`). 
-     НЕ додавай фільтр `AND account_name LIKE '%rent%'` (або подібний) автоматично, якщо користувач не попросив конкретно "статтю оренди" (rent account). Це потрібно, щоб побачити всі витрати офісу (комуналка, прибирання тощо).
 
 5. ТРЕНДИ ТА CTE:
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
@@ -536,31 +639,62 @@ COST: {json.dumps(cost_schema, indent=2)}
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     
+    # Очищення SQL
     sql = sql.replace("```sql", "").replace("```", "").strip()
-    sql = re.sub(r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*", "", sql, flags=re.IGNORECASE | re.MULTILINE)
+    sql = re.sub(
+        r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
+        "",
+        sql,
+        flags=re.IGNORECASE | re.MULTILINE,)
 
     sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
+
+    # --- NEW FIX: Concatenated String Literals ---
+    # Якщо модель розбила текстовий рядок ('text' \n 'text'), склеюємо їх
     sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
     sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
 
-    if (account_no is not None and year is not None and re.search(r"\b(скільки|sum|total)\b", instruction_part.lower()) and not _needs_breakdown(instruction_part)):
+    # -------------------------------
+    # HARD ENFORCEMENT LOGIC
+    # -------------------------------
+
+    # 1. Hardcoded date logic for specific simple queries
+    if (
+        account_no is not None
+        and year is not None
+        and re.search(r"\b(скільки|sum|total)\b", instruction_part.lower())
+        and not _needs_breakdown(instruction_part)
+    ):
         preferred = ["posting_date", "date", "dt", "transaction_date"]
-        date_col = next((c for c in preferred if _schema_has_column(cost_schema, c)), None)
-        if not date_col: raise ValueError("No date column found in COST table")
-        return f"SELECT SUM(ABS(amount_lcy)) AS total_expenses FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'"
-
-    if account_no is not None:
-        if REVENUE_TABLE_REF in sql: raise ValueError("INVALID SQL: revenue table used for account-based cost query")
+        date_col = None
+        for c in preferred:
+            if _schema_has_column(cost_schema, c):
+                date_col = c
+                break
     
-    if metric in {"cost", "opex", "expense", "expenses"}:
-        if REVENUE_TABLE_REF in sql: raise ValueError("INVALID SQL: revenue table used for cost metric")
+        if not date_col:
+            raise ValueError("No date column found in COST table")
+    
+        return f"""
+        SELECT
+            SUM(ABS(amount_lcy)) AS total_expenses
+        FROM `{COST_TABLE_REF}`
+        WHERE account_no = {account_no}
+          AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'
+        """.strip()
 
-    # FIX: Sanitize event_type from COST tables (Hallucination fix)
-    if COST_TABLE_REF in sql:
-        sql = re.sub(r"WHERE\s+event_type\s*=\s*'[^']+'", "WHERE 1=1", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"\bAND\s+event_type\s*=\s*'[^']+'", "", sql, flags=re.IGNORECASE)
+    # 2. Prevent wrong table usage
+    if account_no is not None:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError("INVALID SQL: revenue table used for account-based cost query")
+    
+    
+    # 3. Cost vs Revenue table check
+    if metric in {"cost", "opex", "expense", "expenses"}:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError("INVALID SQL: revenue table used for cost metric")
 
     # 4. Apply Hard Filters
     
@@ -582,8 +716,18 @@ COST: {json.dumps(cost_schema, indent=2)}
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
 
+    # FIX: Sanitize event_type from COST tables (Hallucination fix)
+    if COST_TABLE_REF in sql:
+        # Removes "WHERE event_type = 'opex'" -> "WHERE 1=1"
+        sql = re.sub(r"WHERE\s+event_type\s*=\s*'[^']+'", "WHERE 1=1", sql, flags=re.IGNORECASE)
+        # Removes "AND event_type = 'opex'" -> ""
+        sql = re.sub(r"\bAND\s+event_type\s*=\s*'[^']+'", "", sql, flags=re.IGNORECASE)
+
+    # ПЕРЕВІРКА: Чи це взагалі SQL? (щоб уникнути помилки \320)
     cleaned_start = sql.strip().upper()
     if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
+        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу,
+        # замість того, щоб мучити BigQuery.
         raise ValueError(f"🤖 Відповідь AI (не SQL):\n\n{sql}")
 
     return sql
@@ -595,24 +739,41 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     start_time = time.time()
     instruction_part = instruction.strip()
     
+    # Змінні для логування
     generated_sql = None
     status = "SUCCESS"
     error_details = None
     final_response = ""
     
-    TOKEN_LIMIT_MSG = "⚠️ **Обмеження контексту**\nСпробуйте скоротити період або деталізувати запит."
+    TOKEN_LIMIT_MSG = (
+        "⚠️ **Обмеження контексту**\n"
+        "Спробуйте скоротити період або деталізувати запит."
+    )
 
     try:
-        if not instruction_part: return "Повідомлення порожнє."
+        if not instruction_part:
+            final_response = "Повідомлення порожнє."
+            return final_response
+            
         if (is_trend_question(instruction_part) and not has_explicit_date(instruction_part)):
-            return "❗ Для аналізу динаміки потрібен часовий період.\n\nБудь ласка, уточніть, наприклад:\n• за який місяць?\n• порівняння яких періодів?\n• конкретний діапазон дат (від–до)"
+            final_response = (
+                "❗ Для аналізу динаміки потрібен часовий період.\n\n"
+                "Будь ласка, уточніть, наприклад:\n"
+                "• за який місяць?\n"
+                "• порівняння яких періодів?\n"
+                "• конкретний діапазон дат (від–до)"
+            )
+            return final_response
         
         matched = find_matches_with_ai(instruction_part, smap)
         augmented_instruction = instruction_part
         for field, value in matched:
             augmented_instruction += f" ({field}='{value}')"
 
+        # === ГЕНЕРАЦІЯ SQL (ВСЕРЕДИНІ TRY) ===
         generated_sql = generate_sql(augmented_instruction, smap)
+
+        # === ВИКОНАННЯ ЗАПИТУ ===
         df = execute_cached_query(generated_sql)
 
         if df.empty:
@@ -621,59 +782,80 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
 
+            # === RENDER FUNCTIONS (MOVED UP FOR GLOBAL USE) ===
             def render_table(df: pd.DataFrame, limit: int = 10) -> str:
                 df = df.copy()
                 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-                if num_cols: df = df.sort_values(by=num_cols[0], ascending=False)
+                if num_cols:
+                    df = df.sort_values(by=num_cols[0], ascending=False)
                 df = df.head(limit)
                 for col in num_cols:
-                    df[col] = df[col].round(2).map(lambda x: f"{x:,.2f}".replace(",", " ") if pd.notnull(x) else "")
+                    df[col] = df[col].round(2).map(
+                        lambda x: f"{x:,.2f}".replace(",", " ")
+                        if pd.notnull(x) else ""
+                    )
                 df = df.astype(str)
                 col_widths = {col: max(df[col].map(len).max(), len(col)) for col in df.columns}
                 header = "| " + " | ".join(f"{col:{col_widths[col]}}" for col in df.columns) + " |"
                 separator = "|-" + "-|-".join("-" * col_widths[col] for col in df.columns) + "-|"
-                rows = ["| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |" for _, row in df.iterrows()]
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append("| " + " | ".join(f"{row[col]:{col_widths[col]}}" for col in df.columns) + " |")
                 return "\n".join([header, separator] + rows)
 
             def render_ascii_chart(df: pd.DataFrame, limit: int = 10) -> str:
                 df = df.copy()
                 num_cols = df.select_dtypes(include=["float", "int"]).columns.tolist()
-                if not num_cols: return ""
+                if not num_cols:
+                    return ""
                 val_col = num_cols[0]
                 label_cols = [c for c in df.columns if c != val_col and df[c].dtype == object]
                 label_col = label_cols[0] if label_cols else df.columns[0]
                 df = df.sort_values(by=val_col, ascending=False).head(limit)
-                values, labels = df[val_col].fillna(0).tolist(), df[label_col].astype(str).tolist()
-                max_val = max(values) if values and max(values) > 0 else 1
+                values = df[val_col].fillna(0).tolist()
+                labels = df[label_col].astype(str).tolist()
+                max_len = 30
+                max_val = max(values) if max(values) > 0 else 1
                 lines = ["📊 *TOP-10 графік*"]
                 for label, val in zip(labels, values):
-                    bar_len = int((val / max_val) * 30)
+                    bar_len = int((val / max_val) * max_len)
                     bar = "█" * bar_len
                     val_fmt = f"{val:,.2f}".replace(",", " ")
                     lines.append(f"{label[:12]:12} | {bar:<30} {val_fmt}")
                 return "\n".join(lines)
 
+            # === ЛОГІКА ВИЗНАЧЕННЯ ТИПУ ВІДПОВІДІ ===
             is_detailed_transaction_list = False
             col_names = [c.lower() for c in df.columns]
             has_user_id = any(x in col_names for x in ['user_id', 'email', 'account_no', 'customer_id'])
             has_date = any(x in col_names for x in ['date', 'order_date', 'transaction_date', 'event_date', 'posting_date'])
+            
+            # 1. Список транзакцій (ID + Дата + мало рядків)
             if has_user_id and has_date and len(df) < 30 and len(df) > 0:
                 is_detailed_transaction_list = True
             
+            # 2. Одна відповідь (1 рядок) — ДЛЯ ТОЧНИХ ЗАПИТІВ (Фікс для "У якому місяці...")
             is_single_row_answer = (len(df) == 1)
+
             data_for_ai = df.head(50).to_csv(index=False)
             final_display = ""
             analysis_prompt = ""
 
+            # === РОЗГАЛУЖЕННЯ ВІДОБРАЖЕННЯ ===
             if is_detailed_transaction_list:
+                # ВАРІАНТ 1: Текстовий список
                 analysis_prompt = f"""
 Ти — старший фінансовий аналітик Headway. 
 Твоє завдання — проаналізувати транзакції конкретного користувача/контрагента і вивести їх у чіткому структурованому форматі.
+
 Дані (CSV): 
 {data_for_ai}
+
 Запит користувача: "{instruction_part}"
+
 ФОРМАТ ВІДПОВІДІ (CRITICAL):
 Не малюй таблицю. Виведи нумерований список транзакцій з аналізом.
+
 1. **Заголовок**: "Аналіз транзакцій [ID користувача/назва]"
 2. **Список транзакцій** (для кожної транзакції окремий пункт):
    1. **[Тип транзакції/Статус]** (наприклад: "Початкова підписка", "Продовження", "Refund").
@@ -682,35 +864,48 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
       * **Продукт**: [Назва продукту]
       * **Період**: [Період, якщо є]
       * **Деталі**: (Платформа, Країна, Інше) - що є в даних.
+      
 3. **Висновки фінансового аналітика** (після списку):
    * **Загалом**: Порахуй суму (LTV) або загальний обсяг.
-   * **Поведінка**: Опиши життєвий цикл (тріал -> підписка -> скасування тощо).
+   * **Поведінка**: Опиши життєвий цикл.
    * **Інше**: Цінова стратегія, географія.
+
 Пиши українською мовою. Використовуй Markdown (bold) для ключів.
 """
             elif is_single_row_answer:
+                # ВАРІАНТ 2: Пряма відповідь (Фікс для скріна 2)
                 table_md = render_table(df)
                 final_display = f"```\n{table_md}\n```\n\n"
+                
                 analysis_prompt = f"""
 Ти — фінансовий аналітик.
 SQL запит повернув ОДНЕ значення/рядок. Це і є ПРЯМА ВІДПОВІДЬ.
 Не пиши про "недостатньо даних" або "відсутність контексту".
+
 Дані:
 {data_for_ai}
+
 Запит: "{instruction_part}"
+
 1. 🎯 **Відповідь**: Чітко сформулюй відповідь на основі значення в таблиці.
 2. 💡 **Інсайт** (опціонально): Якщо це метрика (сума, відсоток), дай короткий коментар (багато це чи мало).
+
 Використовуй емоджі та жирний шрифт для акцентів.
 """
             else:
+                # ВАРІАНТ 3: Стандартна таблиця + графік (для агрегацій)
                 table_md = render_table(df)
                 ascii_md = render_ascii_chart(df)
                 final_display = f"```\n{table_md}\n```\n{ascii_md}\n\n"
+
                 analysis_prompt = f"""
 Ти — старший фінансовий аналітик Headway. Твоє завдання — проаналізувати отримані дані.
+
 Дані (CSV, перші 50 рядків): 
 {data_for_ai}
+
 Запит користувача: "{instruction_part}"
+
 ІНСТРУКЦІЇ:
 1. Обов'язково розрахуй частки (відсотки) та пропорції, якщо це доречно.
 2. Якщо у даних є чітке домінування, обов'язково акцентуй на цьому.
@@ -722,15 +917,20 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
    - Використовуй > Blockquotes для головних висновків.
    - Замість списків точками, розбивай на логічні блочки з жирними заголовками.
 """
+            
+            # Генерація відповіді AI
             resp = model.generate_content(analysis_prompt, generation_config={"temperature": 0})
             final_response = final_display + resp.text.strip()
 
     except Exception as e:
         status = "ERROR"
         error_details = str(e)
+        
+        # Обробка лімітів токенів
         if any(k in str(error_details).lower() for k in ["429", "exhausted", "token", "quota"]):
             final_response = (final_display if 'final_display' in locals() else "") + TOKEN_LIMIT_MSG
             status = "TOKEN_LIMIT"
+        # Обробка текстових відповідей від AI замість SQL
         elif "🤖 Відповідь AI" in error_details:
             final_response = error_details.replace("ValueError: ", "")
             status = "SUCCESS" 
@@ -743,7 +943,16 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
     finally:
         end_time = time.time()
         duration = end_time - start_time
-        log_interaction(user_id, instruction_part, generated_sql, final_response, duration, status, error_details)
+        
+        log_interaction(
+            user_id=user_id,
+            prompt=instruction_part,
+            sql=generated_sql,
+            response=final_response,
+            duration=duration,
+            status=status,
+            error_msg=error_details
+        )
 
     return final_response
 
@@ -752,9 +961,15 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     queries = split_into_separate_queries(message)
+    # Фільтрація пустих запитів
     queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
-    if not queries: return "Не вдалося розпізнати запит."
-    if len(queries) == 1: return execute_single_query(queries[0], smap, user_id)
+
+    if not queries:
+        return "Не вдалося розпізнати запит."
+
+    if len(queries) == 1:
+        return execute_single_query(queries[0], smap, user_id)
+        
     out = f"📝 Знайдено {len(queries)} запитів:\n\n"
     for i, q in enumerate(queries, 1):
         ans = execute_single_query(q, smap, user_id)
