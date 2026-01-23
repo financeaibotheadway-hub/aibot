@@ -556,7 +556,7 @@ COST: {json.dumps(cost_schema, indent=2)}
 4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
    - Якщо в запиті є назва категорії витрат (наприклад "Corporate Events", "Software licenses"), додай фільтр:
      `WHERE account_name LIKE '%Назва%'` (наприклад `WHERE account_name LIKE '%Corporate Events%'`).
-   - Якщо запит про "офіси" (office), шукай в `costrev_center_code` значення, що починаються з `IND_OFFICE` або містять `OFFICE`.
+   - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
    - Шукай це в таблиці `{COST_TABLE_REF}`.
 
 5. ТРЕНДИ ТА CTE:
