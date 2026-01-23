@@ -665,6 +665,13 @@ COST: {json.dumps(cost_schema, indent=2)}
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
 
+    # FIX: Sanitize event_type from COST tables (Hallucination fix)
+    if COST_TABLE_REF in sql:
+        # Removes "WHERE event_type = 'opex'" -> "WHERE 1=1"
+        sql = re.sub(r"WHERE\s+event_type\s*=\s*'[^']+'", "WHERE 1=1", sql, flags=re.IGNORECASE)
+        # Removes "AND event_type = 'opex'" -> ""
+        sql = re.sub(r"\bAND\s+event_type\s*=\s*'[^']+'", "", sql, flags=re.IGNORECASE)
+
     # ПЕРЕВІРКА: Чи це взагалі SQL? (щоб уникнути помилки \320)
     cleaned_start = sql.strip().upper()
     if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
