@@ -72,6 +72,11 @@ cache_ttl = 300
 _schema_cache = {}
 _schema_time  = {}
 
+# Кеш для унікальних значень (щоб не смикати базу постійно)
+_values_cache = {}
+_values_cache_time = 0
+VALUES_CACHE_TTL = 3600  # Оновлювати раз на годину
+
 # Флаг, щоб перевіряти наявність таблиці логів лише 1 раз за запуск
 _log_table_checked = False 
 
@@ -162,6 +167,51 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
+# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP ----------------
+def get_database_values_context():
+    """
+    Витягує приклади значень з важливих текстових колонок, щоб AI не 'галюцинував'.
+    Кешується на 1 годину.
+    """
+    global _values_cache, _values_cache_time
+    if time.time() - _values_cache_time < VALUES_CACHE_TTL and _values_cache:
+        return _values_cache
+
+    # Список колонок, для яких ми хочемо знати реальні значення в базі
+    # Це допомагає боту знати, що 'US' це 'US', а не 'USA'
+    cols_to_scan = {
+        REVENUE_TABLE_REF: ["app_name", "geo_country", "platform", "revenue_type", "event_type"],
+        COST_TABLE_REF:    ["costrev_center_code", "account_name", "legal_entity"]
+    }
+
+    context_str = "Приклади значень у базі (використовуй їх для WHERE):\n"
+    
+    for table, cols in cols_to_scan.items():
+        # Перевіряємо, чи існують колонки в схемі перед запитом
+        schema = get_table_schema(table)
+        valid_cols = [c for c in cols if _schema_has_column(schema, c)]
+        
+        if not valid_cols:
+            continue
+
+        # Будуємо легкий запит через APPROX_TOP_COUNT (дешевше і швидше ніж DISTINCT)
+        # або просто LIMIT, якщо APPROX не підтримується для типу.
+        # Для простоти беремо DISTINCT з лімітом.
+        try:
+            for col in valid_cols:
+                sql = f"SELECT DISTINCT {col} FROM `{table}` WHERE {col} IS NOT NULL LIMIT 15"
+                job = bq_client.query(sql)
+                rows = [str(row[0]) for row in job.result()]
+                if rows:
+                    context_str += f"- {col} (в `{table.split('.')[-1]}`): {', '.join(rows)}\n"
+        except Exception as e:
+            logger.warning(f"Error fetching values for {table}: {e}")
+
+    _values_cache = context_str
+    _values_cache_time = time.time()
+    return context_str
+# ----------------------------------------------------------------------
+
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     """
     Розумне додавання WHERE.
@@ -178,20 +228,16 @@ def _ensure_where_filter(sql: str, condition_sql: str) -> str:
     where_match = re.search(r"\bWHERE\b", sql_upper)
     
     if where_match:
-        # Вставляємо одразу після WHERE
         pattern = re.compile(r"\bwhere\b", re.IGNORECASE)
         return pattern.sub(f"WHERE {condition_sql} AND", sql, count=1)
     else:
-        # Шукаємо ключові слова, які мають йти ПІСЛЯ where
         keywords_pattern = r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|WINDOW|HAVING|UNION)\b"
         match = re.search(keywords_pattern, sql, re.IGNORECASE)
         
         if match:
-            # Вставляємо перед знайденим ключовим словом
             idx = match.start()
             return sql[:idx] + f" WHERE {condition_sql} " + sql[idx:]
         else:
-            # Якщо немає GROUP/ORDER/LIMIT, просто додаємо в кінець (але після FROM)
             if "FROM" in sql_upper:
                 return sql + f" WHERE {condition_sql}"
             
@@ -337,11 +383,11 @@ def _sanitize_division_by_zero(sql: str) -> str:
         flags=re.IGNORECASE,
     )
     
-    # Safer regex: match `word / word` or `word.word / word`
+    # Safer regex
     safe_div_pattern = r"""
-        (?P<a>\b[`a-zA-Z0-9_\.]+\b)   # Numerator: simple identifier
+        (?P<a>\b[`a-zA-Z0-9_\.]+\b)   # Numerator
         \s*/\s*                       # Division operator
-        (?P<b>\b[`a-zA-Z0-9_\.]+\b)   # Denominator: simple identifier
+        (?P<b>\b[`a-zA-Z0-9_\.]+\b)   # Denominator
     """
     
     sql = re.sub(
@@ -513,6 +559,9 @@ def generate_sql(instruction_part: str, smap) -> str:
     rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
     cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
 
+    # >>>>> NEW: Get real DB values to hint the LLM <<<<<
+    db_context_hint = get_database_values_context()
+
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання.
 Поточна дата: {today_str}
@@ -520,6 +569,8 @@ def generate_sql(instruction_part: str, smap) -> str:
 Завдання: "{instruction_part}"
 
 {metric_hint}
+
+{db_context_hint}
 
 Повні назви таблиць:
 REVENUE_TABLE = `{REVENUE_TABLE_REF}`
@@ -554,10 +605,9 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
 
 4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
-   - Якщо в запиті є назва категорії витрат (наприклад "Corporate Events", "Software licenses"), додай фільтр:
-     `WHERE account_name LIKE '%Назва%'` (наприклад `WHERE account_name LIKE '%Corporate Events%'`).
+   - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
+   - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
    - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
-   - Шукай це в таблиці `{COST_TABLE_REF}`.
 
 5. ТРЕНДИ ТА CTE:
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
