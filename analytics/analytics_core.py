@@ -580,6 +580,9 @@ COST: {json.dumps(cost_schema, indent=2)}
 8. СПЕЦИФІЧНІ ТЕРМІНИ:
    - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
    - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
+   
+9. LTV (Lifetime Value):
+   - Якщо запит "LTV когорти" або "найвищий LTV": використовуй SUM(gross_usd) (загальний дохід когорти), якщо не сказано "середній/average".
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
