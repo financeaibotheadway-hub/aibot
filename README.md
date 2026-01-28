@@ -174,3 +174,6 @@ Socket Mode підключився, але повідомлення не при�
 10) Контакти / підтримка
 
 Якщо потрібна допомога — писати на finance.ai.bot.headway@gmail.com / twinslytics@gmail.com
+
+11) GCP service account acceses - <img width="443" height="320" alt="image" src="https://github.com/user-attachments/assets/66719a35-296b-4d63-ab1e-8103076e70d0" />
+
