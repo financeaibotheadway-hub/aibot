@@ -87,7 +87,7 @@ _log_table_checked = False
 
 def extract_account_no(text: str) -> int | None:
     m = re.search(
-        r"(рахунк(у|ом)?|account|acct)\s*(№|number)?\s*(\d{4,10})",
+        r"(рахун(ок|к|ку|ом)?|account|acct)\s*(№|number)?\s*(\d{4,10})",
         text.lower()
     )
     if m:
@@ -100,6 +100,7 @@ EVENT_TYPE_BY_INTENT = {
     "subscription": "sale",
     "subscriptions": "sale",
     "підписка": "sale",
+    "підписок": "sale",
     "підписки": "sale",
     "purchase": "sale",
     "покупка": "sale",
