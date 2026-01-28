@@ -53,7 +53,8 @@ if MODE == "dev":
     ) -> None:
         """
         1) Sends bot answer to DM
-        2) Optionally sends ephemeral note in source channel/thread: "Answered in DM"
+        2) Tries to send ephemeral note in the SAME THREAD (if possible)
+           Fallback: sends ephemeral in channel (no thread_ts)
         """
         # 1) run analysis
         try:
@@ -69,22 +70,33 @@ if MODE == "dev":
         except Exception:
             logger.exception("Failed to post DM message")
 
-        # 3) Ephemeral note in channel (visible only to the user)
+        # 3) Ephemeral note (visible only to the user)
         if send_ephemeral and source_channel:
-            try:
-                payload = {
-                    "channel": source_channel,
-                    "user": user_id,
-                    "text": "✅ Відповів у DM.",
-                }
-                # якщо виклик був у треді — покажемо нотис у треді
-                if source_thread_ts:
-                    payload["thread_ts"] = source_thread_ts
+            base_payload = {
+                "channel": source_channel,
+                "user": user_id,
+                "text": "✅ Відповів у DM.",
+            }
 
-                app.client.chat_postEphemeral(**payload)
+            # 3.1) Try to post ephemeral in thread
+            if source_thread_ts:
+                try:
+                    payload = dict(base_payload)
+                    payload["thread_ts"] = source_thread_ts
+                    app.client.chat_postEphemeral(**payload)
+                    return
+                except Exception as e:
+                    # Часто Slack не показує ephemeral в thread або кидає invalid_arguments.
+                    # Робимо fallback в канал без thread_ts.
+                    logger.warning(
+                        f"Ephemeral in thread failed, fallback to channel. Reason: {e}"
+                    )
+
+            # 3.2) Fallback: ephemeral in channel (no thread_ts)
+            try:
+                app.client.chat_postEphemeral(**base_payload)
             except Exception:
-                # якщо немає прав / не підтримується — просто мовчимо
-                logger.exception("Failed to post ephemeral message")
+                logger.exception("Failed to post ephemeral message (fallback)")
 
     @app.event("app_mention")
     def handle_mention(event, logger):
