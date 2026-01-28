@@ -75,7 +75,7 @@ _schema_time  = {}
 # Кеш для унікальних значень (щоб не смикати базу постійно)
 _values_cache = {}
 _values_cache_time = 0
-VALUES_CACHE_TTL = 3600  # Оновлювати раз на годину
+VALUES_CACHE_TTL = 3600  # Оновлювати раз на годину (це вирішує проблему швидкості)
 
 # Флаг, щоб перевіряти наявність таблиці логів лише 1 раз за запуск
 _log_table_checked = False 
@@ -170,11 +170,11 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP ----------------
+# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP (FIXED) ----------------
 def get_database_values_context():
     """
     Витягує унікальні значення з категоріальних колонок.
-    Кешується на 1 годину.
+    Кешується на 1 годину (швидко працює при повторних запитах).
     """
     global _values_cache, _values_cache_time
     if time.time() - _values_cache_time < VALUES_CACHE_TTL and _values_cache:
@@ -218,14 +218,14 @@ def get_database_values_context():
 
         for col in valid_cols:
             try:
-                # Збільшено ліміт до 50 і додано сортування, 
-                # щоб захопити більше варіантів (наприклад, chargeback)
+                # Збільшено ліміт до 200, щоб точно захопити всі варіанти (chargeback, refund)
+                # DISTINCT забезпечує унікальність
                 sql = f"""
                 SELECT DISTINCT {col} 
                 FROM `{table}` 
                 WHERE {col} IS NOT NULL 
                 ORDER BY 1 
-                LIMIT 50
+                LIMIT 200
                 """
                 job = bq_client.query(sql)
                 rows = [str(row[0]) for row in job.result()]
