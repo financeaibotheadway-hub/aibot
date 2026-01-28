@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import json
 import logging
 import asyncio
 import re
@@ -34,6 +33,7 @@ def process_slack_message(
     )
     return response
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV / LOG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,6 +53,26 @@ verifier = SignatureVerifier(signing_secret=SLACK_SIGNING_SECRET)
 
 processed_event_ids = TTLCache(maxsize=2000, ttl=120)
 
+# DM channel cache (user_id -> dm_channel_id)
+dm_channel_cache = TTLCache(maxsize=5000, ttl=24 * 3600)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DM Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+async def _get_dm_channel_id(user_id: str) -> str:
+    """
+    Return DM channel id for user_id (opens DM if needed).
+    Requires scopes: im:write, conversations:write
+    """
+    if user_id in dm_channel_cache:
+        return dm_channel_cache[user_id]
+
+    resp = await client.conversations_open(users=user_id)
+    dm_channel_id = resp["channel"]["id"]
+    dm_channel_cache[user_id] = dm_channel_id
+    return dm_channel_id
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -69,11 +89,27 @@ def _strip_bot_mention(text: str) -> str:
     return text.strip()
 
 
+async def _send_ephemeral_ack(channel: str, user_id: str, text: str) -> None:
+    """
+    Sends an ephemeral message visible only to user_id in the given channel.
+    Requires scope: chat:write
+    """
+    try:
+        await client.chat_postEphemeral(
+            channel=channel,
+            user=user_id,
+            text=text,
+        )
+    except Exception:
+        logger.exception("Failed to post ephemeral ack")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Slack Events Handler
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_event(req: Request):
 
+    # Avoid duplicate processing on Slack retries
     if req.headers.get("X-Slack-Retry-Num"):
         return JSONResponse(content={"ok": True})
 
@@ -93,23 +129,27 @@ async def handle_event(req: Request):
         logger.exception("Bad JSON from Slack")
         return JSONResponse(status_code=400, content={"error": "bad json"})
 
+    # URL verification handshake
     if payload.get("type") == "url_verification":
         return JSONResponse(content={"challenge": payload.get("challenge")})
 
     event = payload.get("event", {}) or {}
     event_id = payload.get("event_id") or event.get("client_msg_id")
 
+    # Deduplicate events
     if event_id and event_id in processed_event_ids:
         return JSONResponse(content={"ok": True})
     if event_id:
         processed_event_ids[event_id] = True
 
+    # Ignore bot messages
     if event.get("bot_id") is not None:
         return JSONResponse(content={"ok": True})
 
     evt_type = event.get("type")
     channel_type = event.get("channel_type")
 
+    # Respond for mentions in channels OR any message in DM
     if evt_type == "app_mention" or channel_type == "im":
 
         raw_text = event.get("text", "")
@@ -122,7 +162,13 @@ async def handle_event(req: Request):
         logger.info(f"Slack message from {user_id}: {user_text}")
 
         asyncio.create_task(
-            _respond_async(user_text, channel, user_id, thread_ts)
+            _respond_async(
+                user_text=user_text,
+                source_channel=channel,
+                user_id=user_id,
+                source_channel_type=channel_type,
+                thread_ts=thread_ts,
+            )
         )
 
     return JSONResponse(content={"ok": True})
@@ -131,24 +177,37 @@ async def handle_event(req: Request):
 # ──────────────────────────────────────────────────────────────────────────────
 # Background Processor
 # ──────────────────────────────────────────────────────────────────────────────
-async def _respond_async(user_text: str, channel: str, user_id: str, thread_ts: str | None):
-
+async def _respond_async(
+    user_text: str,
+    source_channel: str,
+    user_id: str,
+    source_channel_type: str | None,
+    thread_ts: str | None
+):
+    """
+    Always respond in DM to the author (even if message came from a channel).
+    Additionally, if message came from a channel, send an ephemeral ack there.
+    """
+    # 1) Run analysis
     try:
         response = await asyncio.to_thread(
-        process_slack_message,
-        text=user_text,
-        user_id=user_id,
-    )
+            process_slack_message,
+            text=user_text,
+            user_id=user_id,
+        )
     except Exception as e:
         logger.exception("Error in run_analysis()")
         response = f"❌ Помилка: {str(e)}"
 
+    # 2) Send response to DM
     try:
-        msg = {"channel": channel, "text": response}
-        if thread_ts:
-            msg["thread_ts"] = thread_ts
-
-        await client.chat_postMessage(**msg)
-
+        dm_channel = await _get_dm_channel_id(user_id)
+        await client.chat_postMessage(channel=dm_channel, text=response)
     except Exception:
-        logger.exception("Failed to post message to Slack")
+        logger.exception("Failed to post DM message to Slack")
+
+    # 3) Ephemeral ack in source channel (only if NOT DM)
+    #    In DM channel_type == "im", no need to ack.
+    if source_channel_type != "im":
+        ack_text = "✅ Я відповів тобі в DM, щоб не засмічувати канал."
+        await _send_ephemeral_ack(source_channel, user_id, ack_text)
