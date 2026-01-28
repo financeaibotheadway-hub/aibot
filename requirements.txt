@@ -13,3 +13,4 @@ cachetools
 sqlparse
 python-dateutil
 slack-bolt
+pytest
