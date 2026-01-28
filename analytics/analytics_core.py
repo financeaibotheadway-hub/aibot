@@ -72,10 +72,10 @@ cache_ttl = 300
 _schema_cache = {}
 _schema_time  = {}
 
-# Кеш для унікальних значень (щоб не смикати базу постійно)
-_values_cache = {}
-_values_cache_time = 0
-VALUES_CACHE_TTL = 3600  # Оновлювати раз на годину (це вирішує проблему швидкості)
+# Кеш для унікальних значень (оновлена назва змінної для примусового скидання старого кешу)
+_db_context_cache = {}
+_db_context_time = 0
+VALUES_CACHE_TTL = 3600  # Оновлювати раз на годину
 
 # Флаг, щоб перевіряти наявність таблиці логів лише 1 раз за запуск
 _log_table_checked = False 
@@ -170,15 +170,14 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP (FIXED) ----------------
+# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP (FIXED v2) ----------------
 def get_database_values_context():
     """
     Витягує унікальні значення з категоріальних колонок.
-    Кешується на 1 годину (швидко працює при повторних запитах).
     """
-    global _values_cache, _values_cache_time
-    if time.time() - _values_cache_time < VALUES_CACHE_TTL and _values_cache:
-        return _values_cache
+    global _db_context_cache, _db_context_time
+    if time.time() - _db_context_time < VALUES_CACHE_TTL and _db_context_cache:
+        return _db_context_cache
 
     # Оновлений список колонок (включаючи ті, що на скріншотах: document_type, source_code)
     cols_to_scan = {
@@ -218,14 +217,14 @@ def get_database_values_context():
 
         for col in valid_cols:
             try:
-                # Збільшено ліміт до 200, щоб точно захопити всі варіанти (chargeback, refund)
-                # DISTINCT забезпечує унікальність
+                # Збільшено ліміт до 500!
+                # DISTINCT забезпечує унікальність, ORDER BY - стабільність
                 sql = f"""
                 SELECT DISTINCT {col} 
                 FROM `{table}` 
                 WHERE {col} IS NOT NULL 
                 ORDER BY 1 
-                LIMIT 200
+                LIMIT 500
                 """
                 job = bq_client.query(sql)
                 rows = [str(row[0]) for row in job.result()]
@@ -236,8 +235,8 @@ def get_database_values_context():
             except Exception as e:
                 logger.warning(f"Error fetching values for {table} col {col}: {e}")
 
-    _values_cache = context_str
-    _values_cache_time = time.time()
+    _db_context_cache = context_str
+    _db_context_time = time.time()
     return context_str
 # ----------------------------------------------------------------------
 
@@ -616,10 +615,10 @@ REVENUE: {json.dumps(rev_schema, indent=2)}
 COST: {json.dumps(cost_schema, indent=2)}
 
 Правила SQL (CRITICAL):
-1. ПОРІВНЯННЯ ТЕКСТУ (CASE INSENSITIVITY):
-   - Значення в базі можуть бути в різному регістрі ('Refund', 'refund', 'REFUND').
-   - ЗАВЖДИ використовуй `LOWER(column) = 'значення'`, якщо не впевнений.
-   - Приклад: `WHERE LOWER(event_type) = 'refund'` (а не `='Refund'`).
+1. ПОРІВНЯННЯ ТЕКСТУ (CASE INSENSITIVITY & CLEANING):
+   - Значення в базі можуть бути в різному регістрі ('Refund', 'refund', 'REFUND') або з пробілами.
+   - ЗАВЖДИ використовуй `TRIM(LOWER(column)) = 'значення'`, якщо не впевнений.
+   - Приклад: `WHERE TRIM(LOWER(event_type)) = 'refund'` (а не `='Refund'`).
    - Дивись на блок "Реальні значення в базі" вище, щоб брати правильні назви (наприклад, 'ADJCOST', 'SALES').
    
 2. ЧАСОВІ ФІЛЬТРИ ("останні 3 місяці", "минулий рік" тощо):
@@ -628,21 +627,22 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Не використовуй `BETWEEN` зі статичними датами, якщо просять відносний період ("останні...").
    - ⚠️ ВАЖЛИВО: Якщо користувач НЕ вказав конкретну дату чи період, НЕ додавай умову `WHERE date ...`. Аналізуй дані за весь доступний час.
 
-3. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
-   - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
-   - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
-   - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
-
-4. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
+3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
+   - НЕ додавай фільтри по `app_name`, `platform`, `geo_country`, якщо користувач про це прямо не просив.
    - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
      `AND column != 'value'` або `AND column NOT IN (...)`.
    - Мапінг країн (для geo_country): "США/USA" -> 'US', "Україна" -> 'UA', "Британія" -> 'GB'.
    - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
 
-5. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
+4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
    - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
    - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
    - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
+
+5. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
+   - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
+   - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
+   - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
 
 6. ТРЕНДИ ТА CTE:
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
