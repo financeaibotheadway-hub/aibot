@@ -1,26 +1,51 @@
-# tests/conftest.py
+conftest_code = """
 import sys
 import os
 import pytest
 from unittest.mock import MagicMock
 
-# 1. Додаємо корінь проекту в шлях імпорту, щоб бачити модуль analytics
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-# 2. Встановлюємо тестові змінні оточення
+# Встановлюємо фейкові змінні оточення
 os.environ["BIGQUERY_PROJECT"] = "test-project"
 os.environ["BQ_DATASET"] = "test_dataset"
-os.environ["BQ_REVENUE_TABLE"] = "revenue_table"
-os.environ["BQ_COST_TABLE"] = "cost_table"
+os.environ["BQ_REVENUE_TABLE"] = "rev_tbl"
+os.environ["BQ_COST_TABLE"] = "cost_tbl"
 
-# 3. Мокаємо (імітуємо) BigQuery та VertexAI, щоб при імпорті analytics_core не було помилки авторизації
-# Це потрібно, якщо ми хочемо тестувати тільки логіку (test_logic.py) без ключів
+# --- ГОЛОВНИЙ ХАК ---
+# Ми підміняємо модулі Google ще ДО того, як будь-який тест почне їх імпортувати.
+# Це робиться на рівні глобального імпорту.
+
+mock_bq = MagicMock()
+mock_vertex = MagicMock()
+mock_aiplatform = MagicMock()
+
+# Налаштовуємо мок для BigQuery Client
+mock_client = MagicMock()
+mock_bq.Client.return_value = mock_client
+
+# Коли код просить get_table, повертаємо фейкову таблицю зі схемою
+mock_table = MagicMock()
+mock_table.schema = [
+    MagicMock(name="date", field_type="DATE"),
+    MagicMock(name="revenue", field_type="FLOAT"),
+    MagicMock(name="account_no", field_type="INTEGER"),
+    MagicMock(name="event_type", field_type="STRING"),
+    MagicMock(name="geo_country", field_type="STRING"),
+]
+mock_client.get_table.return_value = mock_table
+
+# Жорстко записуємо фейки в sys.modules
+sys.modules["google.cloud"] = MagicMock()
+sys.modules["google.cloud.bigquery"] = mock_bq
+sys.modules["google.cloud.aiplatform"] = mock_aiplatform
+sys.modules["vertexai"] = mock_vertex
+sys.modules["vertexai.preview.generative_models"] = MagicMock()
+
 @pytest.fixture(autouse=True)
-def mock_google_clients(monkeypatch):
-    mock_bq = MagicMock()
-    mock_vertex = MagicMock()
-    
-    # Підміняємо реальні бібліотеки на фейкові для тестів
-    monkeypatch.setitem(sys.modules, 'google.cloud.bigquery', mock_bq)
-    monkeypatch.setitem(sys.modules, 'vertexai', mock_vertex)
-    monkeypatch.setitem(sys.modules, 'vertexai.preview.generative_models', MagicMock())
+def _setup_env():
+    # Цей фікстур просто для гарантії, основна робота зроблена вище
+    pass
+"""
+
+with open("tests/conftest.py", "w") as f:
+    f.write(conftest_code)
+print("✅ conftest.py оновлено.")
