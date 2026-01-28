@@ -173,42 +173,68 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
 # ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP ----------------
 def get_database_values_context():
     """
-    Витягує приклади значень з важливих текстових колонок, щоб AI не 'галюцинував'.
+    Витягує унікальні значення з категоріальних колонок.
     Кешується на 1 годину.
     """
     global _values_cache, _values_cache_time
     if time.time() - _values_cache_time < VALUES_CACHE_TTL and _values_cache:
         return _values_cache
 
-    # Список колонок, для яких ми хочемо знати реальні значення в базі
-    # Це допомагає боту знати, що 'US' це 'US', а не 'USA'
+    # Оновлений список колонок (включаючи ті, що на скріншотах: document_type, source_code)
     cols_to_scan = {
-        REVENUE_TABLE_REF: ["app_name", "geo_country", "platform", "revenue_type", "event_type"],
-        COST_TABLE_REF:    ["costrev_center_code", "account_name", "legal_entity"]
+        REVENUE_TABLE_REF: [
+            "event_type",   # refund, sale, trial
+            "revenue_type", # New, Retained
+            "platform",     # Web, iOS
+            "app_name",     # headway, nibble
+            "geo_country"   # US, GB, CA
+        ],
+        COST_TABLE_REF: [
+            "document_type", # SALES, PURCHASES, ADJCOST
+            "source_code",   # PAYMENTJNL
+            "legal_entity",  # GlobalServe...
+            "account_name",
+            "costrev_center_code"
+        ]
     }
 
-    context_str = "Приклади значень у базі (використовуй їх для WHERE):\n"
+    context_str = "ВАЖЛИВО: Реальні значення в базі (використовуй ТІЛЬКИ їх для фільтрів WHERE):\n"
     
     for table, cols in cols_to_scan.items():
-        # Перевіряємо, чи існують колонки в схемі перед запитом
-        schema = get_table_schema(table)
-        valid_cols = [c for c in cols if _schema_has_column(schema, c)]
+        try:
+            # Перевіряємо наявність таблиці/схеми
+            schema = bq_client.get_table(table).schema
+            existing_cols = {f.name for f in schema}
+        except Exception:
+            continue
+
+        valid_cols = [c for c in cols if c in existing_cols]
         
         if not valid_cols:
             continue
+            
+        table_short = table.split('.')[-1]
+        context_str += f"\nТаблиця `{table_short}`:\n"
 
-        # Будуємо легкий запит через APPROX_TOP_COUNT (дешевше і швидше ніж DISTINCT)
-        # або просто LIMIT, якщо APPROX не підтримується для типу.
-        # Для простоти беремо DISTINCT з лімітом.
-        try:
-            for col in valid_cols:
-                sql = f"SELECT DISTINCT {col} FROM `{table}` WHERE {col} IS NOT NULL LIMIT 15"
+        for col in valid_cols:
+            try:
+                # Збільшено ліміт до 50 і додано сортування, 
+                # щоб захопити більше варіантів (наприклад, chargeback)
+                sql = f"""
+                SELECT DISTINCT {col} 
+                FROM `{table}` 
+                WHERE {col} IS NOT NULL 
+                ORDER BY 1 
+                LIMIT 50
+                """
                 job = bq_client.query(sql)
                 rows = [str(row[0]) for row in job.result()]
+                
                 if rows:
-                    context_str += f"- {col} (в `{table.split('.')[-1]}`): {', '.join(rows)}\n"
-        except Exception as e:
-            logger.warning(f"Error fetching values for {table}: {e}")
+                    vals = ", ".join([f"'{r}'" for r in rows])
+                    context_str += f"   - Колонка `{col}` містить: [{vals}]\n"
+            except Exception as e:
+                logger.warning(f"Error fetching values for {table} col {col}: {e}")
 
     _values_cache = context_str
     _values_cache_time = time.time()
@@ -589,39 +615,45 @@ COST_TABLE    = `{COST_TABLE_REF}`
 REVENUE: {json.dumps(rev_schema, indent=2)}
 COST: {json.dumps(cost_schema, indent=2)}
 
-Правила SQL:
-1. ЧАСОВІ ФІЛЬТРИ ("останні 3 місяці", "минулий рік" тощо):
+Правила SQL (CRITICAL):
+1. ПОРІВНЯННЯ ТЕКСТУ (CASE INSENSITIVITY):
+   - Значення в базі можуть бути в різному регістрі ('Refund', 'refund', 'REFUND').
+   - ЗАВЖДИ використовуй `LOWER(column) = 'значення'`, якщо не впевнений.
+   - Приклад: `WHERE LOWER(event_type) = 'refund'` (а не `='Refund'`).
+   - Дивись на блок "Реальні значення в базі" вище, щоб брати правильні назви (наприклад, 'ADJCOST', 'SALES').
+   
+2. ЧАСОВІ ФІЛЬТРИ ("останні 3 місяці", "минулий рік" тощо):
    - Використовуй поле дати (наприклад `order_date`, `date`, `created_at` — яке є в схемі).
    - Для "останні X місяців" використовуй: `WHERE date_column >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL X MONTH)`.
    - Не використовуй `BETWEEN` зі статичними датами, якщо просять відносний період ("останні...").
    - ⚠️ ВАЖЛИВО: Якщо користувач НЕ вказав конкретну дату чи період, НЕ додавай умову `WHERE date ...`. Аналізуй дані за весь доступний час.
 
-2. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
+3. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
    - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
    - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
    - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
 
-3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
+4. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
    - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
      `AND column != 'value'` або `AND column NOT IN (...)`.
    - Мапінг країн (для geo_country): "США/USA" -> 'US', "Україна" -> 'UA', "Британія" -> 'GB'.
    - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
 
-4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
+5. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
    - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
    - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
    - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
 
-5. ТРЕНДИ ТА CTE:
+6. ТРЕНДИ ТА CTE:
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
    - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
    - НЕ обривай запит на середині.
 
-6. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились" або "new revenue"):
+7. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились" або "new revenue"):
    - ⚠️ ОБОВ'ЯЗКОВО включай колонку ДАТИ в SELECT (наприклад `MIN(date)` as `first_seen`), навіть якщо користувач не просив. Це потрібно для аналізу.
    - Використовуй логіку: `SELECT vendor_name, MIN(date) as first_seen FROM ... GROUP BY vendor_name HAVING first_seen >= 'YYYY-01-01'`.
    
-7. ЗАГАЛЬНІ:
+8. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
    - Якщо запит про "revenue/дохід" — таблиця `{REVENUE_TABLE_REF}`. Якщо "cost/витрати" — `{COST_TABLE_REF}`.
    - Для агрегатів завжди давай alias (наприклад `total_revenue`).
@@ -631,11 +663,11 @@ COST: {json.dumps(cost_schema, indent=2)}
    - НЕ використовуй SAFE_DIVIDE сам, це зробить авто-корекція. Просто пиши `/`.
    - Поверни ТІЛЬКИ SQL код.
    
-8. СПЕЦИФІЧНІ ТЕРМІНИ:
+9. СПЕЦИФІЧНІ ТЕРМІНИ:
    - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
    - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
    
-9. LTV (Lifetime Value):
+10. LTV (Lifetime Value):
    - Якщо запит "LTV когорти" або "найвищий LTV": використовуй SUM(gross_usd) (загальний дохід когорти), якщо не сказано "середній/average".
 """
 
