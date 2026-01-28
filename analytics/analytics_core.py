@@ -695,7 +695,16 @@ COST: {json.dumps(cost_schema, indent=2)}
     
     
     # 3. Cost vs Revenue table check
-    if metric in {"cost", "opex", "expense", "expenses"}:
+    user_query_lower = instruction_part.lower()
+    is_cost_query = (
+        metric in {"cost", "opex", "expense", "expenses"} 
+        or "cost" in user_query_lower 
+        or "витрат" in user_query_lower 
+        or "opex" in user_query_lower
+    )
+
+    if is_cost_query:
+        # Якщо питають про витрати, але SQL лізе в таблицю доходів -> БЛОКУЄМО
         if REVENUE_TABLE_REF in sql:
             raise ValueError("INVALID SQL: revenue table used for cost metric")
 
