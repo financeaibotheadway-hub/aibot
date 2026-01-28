@@ -170,74 +170,96 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP (FIXED v2) ----------------
+# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP (OPTIMIZED) ----------------
 def get_database_values_context():
     """
     Витягує унікальні значення з категоріальних колонок.
+    ОПТИМІЗАЦІЯ: Сканує тільки останні 90 днів даних, щоб не навантажувати базу.
     """
     global _db_context_cache, _db_context_time
-    if time.time() - _db_context_time < VALUES_CACHE_TTL and _db_context_cache:
+    
+    # Кешування на 1 годину
+    if _db_context_cache and (time.time() - _db_context_time < VALUES_CACHE_TTL):
         return _db_context_cache
 
-    # Оновлений список колонок (включаючи ті, що на скріншотах: document_type, source_code)
+    logger.info("♻️ Refreshing DB Context (Last 90 Days)...")
+
     cols_to_scan = {
         REVENUE_TABLE_REF: [
-            "event_type",   # refund, sale, trial
+            "event_type",   # refund, sale, chargeback
             "revenue_type", # New, Retained
             "platform",     # Web, iOS
             "app_name",     # headway, nibble
-            "geo_country"   # US, GB, CA
+            "geo_country",  # US, GB
+            "provider"      # Paypal, Apple
         ],
         COST_TABLE_REF: [
-            "document_type", # SALES, PURCHASES, ADJCOST
-            "source_code",   # PAYMENTJNL
-            "legal_entity",  # GlobalServe...
-            "account_name",
-            "costrev_center_code"
+            "document_type", # SALES, PURCHASES
+            "legal_entity",  # GTHW
+            "costrev_center_code",
+            "source_code"
         ]
     }
 
-    context_str = "ВАЖЛИВО: Реальні значення в базі (використовуй ТІЛЬКИ їх для фільтрів WHERE):\n"
+    context_lines = ["ВАЖЛИВО: Реальні значення в базі (використовуй ТІЛЬКИ їх для WHERE):"]
     
     for table, cols in cols_to_scan.items():
         try:
-            # Перевіряємо наявність таблиці/схеми
-            schema = bq_client.get_table(table).schema
-            existing_cols = {f.name for f in schema}
+            # Отримуємо схему таблиці
+            schema_objs = get_table_schema(table)
+            existing_cols = {c['name'] for c in schema_objs}
         except Exception:
             continue
-
-        valid_cols = [c for c in cols if c in existing_cols]
         
-        if not valid_cols:
-            continue
-            
+        # Шукаємо колонку дати для оптимізації (щоб не сканувати всю історію)
+        date_col = None
+        for field in schema_objs:
+            if field['type'] in ('DATE', 'DATETIME', 'TIMESTAMP'):
+                date_col = field['name']
+                break # Беремо першу знайдену дату
+
         table_short = table.split('.')[-1]
-        context_str += f"\nТаблиця `{table_short}`:\n"
-
-        for col in valid_cols:
+        
+        for col in cols:
+            if col not in existing_cols:
+                continue
+            
             try:
-                # Збільшено ліміт до 500!
-                # DISTINCT забезпечує унікальність, ORDER BY - стабільність
-                sql = f"""
-                SELECT DISTINCT {col} 
-                FROM `{table}` 
-                WHERE {col} IS NOT NULL 
-                ORDER BY 1 
-                LIMIT 500
-                """
-                job = bq_client.query(sql)
-                rows = [str(row[0]) for row in job.result()]
+                # Побудова оптимізованого запиту
+                if date_col:
+                    # Якщо є дата -> беремо унікальні значення тільки за останні 90 днів
+                    # Це дозволяє працювати швидко навіть на мільярдах рядків
+                    query = f"""
+                        SELECT DISTINCT {col} 
+                        FROM `{table}` 
+                        WHERE {col} IS NOT NULL 
+                          AND {date_col} >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL 90 DAY)
+                        ORDER BY 1
+                        LIMIT 500
+                    """
+                else:
+                    # Якщо дати немає (довідник) -> беремо все, але з лімітом
+                    query = f"""
+                        SELECT DISTINCT {col} 
+                        FROM `{table}` 
+                        WHERE {col} IS NOT NULL 
+                        ORDER BY 1
+                        LIMIT 500
+                    """
                 
-                if rows:
-                    vals = ", ".join([f"'{r}'" for r in rows])
-                    context_str += f"   - Колонка `{col}` містить: [{vals}]\n"
+                job = bq_client.query(query)
+                values = [str(row[0]) for row in job.result()]
+                
+                if values:
+                    val_str = ", ".join([f"'{v}'" for v in values])
+                    context_lines.append(f"- Таблиця `{table_short}`, колонка `{col}`: [{val_str}]")
+                    
             except Exception as e:
-                logger.warning(f"Error fetching values for {table} col {col}: {e}")
+                logger.warning(f"⚠️ Context fetch error for {table}.{col}: {e}")
 
-    _db_context_cache = context_str
+    _db_context_cache = "\n".join(context_lines)
     _db_context_time = time.time()
-    return context_str
+    return _db_context_cache
 # ----------------------------------------------------------------------
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
@@ -614,46 +636,40 @@ COST_TABLE    = `{COST_TABLE_REF}`
 REVENUE: {json.dumps(rev_schema, indent=2)}
 COST: {json.dumps(cost_schema, indent=2)}
 
-Правила SQL (CRITICAL):
-1. ПОРІВНЯННЯ ТЕКСТУ (CASE INSENSITIVITY & CLEANING):
-   - Значення в базі можуть бути в різному регістрі ('Refund', 'refund', 'REFUND') або з пробілами.
-   - ЗАВЖДИ використовуй `TRIM(LOWER(column)) = 'значення'`, якщо не впевнений.
-   - Приклад: `WHERE TRIM(LOWER(event_type)) = 'refund'` (а не `='Refund'`).
-   - Дивись на блок "Реальні значення в базі" вище, щоб брати правильні назви (наприклад, 'ADJCOST', 'SALES').
-   
-2. ЧАСОВІ ФІЛЬТРИ ("останні 3 місяці", "минулий рік" тощо):
+Правила SQL:
+1. ЧАСОВІ ФІЛЬТРИ ("останні 3 місяці", "минулий рік" тощо):
    - Використовуй поле дати (наприклад `order_date`, `date`, `created_at` — яке є в схемі).
    - Для "останні X місяців" використовуй: `WHERE date_column >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL X MONTH)`.
    - Не використовуй `BETWEEN` зі статичними датами, якщо просять відносний період ("останні...").
    - ⚠️ ВАЖЛИВО: Якщо користувач НЕ вказав конкретну дату чи період, НЕ додавай умову `WHERE date ...`. Аналізуй дані за весь доступний час.
 
+2. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
+   - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
+   - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
+   - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
+
 3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
-   - НЕ додавай фільтри по `app_name`, `platform`, `geo_country`, якщо користувач про це прямо не просив.
    - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
      `AND column != 'value'` або `AND column NOT IN (...)`.
    - Мапінг країн (для geo_country): "США/USA" -> 'US', "Україна" -> 'UA', "Британія" -> 'GB'.
    - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
+   - **НЕ** додавай фільтри по `app_name`, `platform`, `geo_country`, якщо користувач про це прямо не просив.
 
 4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
    - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
    - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
    - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
 
-5. ГРУПУВАННЯ ЧАСУ ("потижнево", "weekly", "по місяцях"):
-   - Для "потижнево": `GROUP BY DATE_TRUNC(date_column, WEEK)`, у SELECT додай `DATE_TRUNC(date_column, WEEK) AS week_start`.
-   - Для "по місяцях": `GROUP BY DATE_TRUNC(date_column, MONTH)`.
-   - Обов'язково додай `ORDER BY week_start ASC` (або month_start) для графіків.
-
-6. ТРЕНДИ ТА CTE:
+5. ТРЕНДИ ТА CTE:
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
    - Обов'язково додай фінальний `SELECT * FROM CTE_NAME` в кінці.
    - НЕ обривай запит на середині.
 
-7. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились" або "new revenue"):
+6. НОВІ / ACQUISITION (Якщо питають "які нові контрагенти/vendors з'явились" або "new revenue"):
    - ⚠️ ОБОВ'ЯЗКОВО включай колонку ДАТИ в SELECT (наприклад `MIN(date)` as `first_seen`), навіть якщо користувач не просив. Це потрібно для аналізу.
    - Використовуй логіку: `SELECT vendor_name, MIN(date) as first_seen FROM ... GROUP BY vendor_name HAVING first_seen >= 'YYYY-01-01'`.
    
-8. ЗАГАЛЬНІ:
+7. ЗАГАЛЬНІ:
    - Використовуй ТІЛЬКИ поля зі схеми вище. Не вигадуй нових полів.
    - Якщо запит про "revenue/дохід" — таблиця `{REVENUE_TABLE_REF}`. Якщо "cost/витрати" — `{COST_TABLE_REF}`.
    - Для агрегатів завжди давай alias (наприклад `total_revenue`).
@@ -663,12 +679,18 @@ COST: {json.dumps(cost_schema, indent=2)}
    - НЕ використовуй SAFE_DIVIDE сам, це зробить авто-корекція. Просто пиши `/`.
    - Поверни ТІЛЬКИ SQL код.
    
-9. СПЕЦИФІЧНІ ТЕРМІНИ:
+8. СПЕЦИФІЧНІ ТЕРМІНИ:
    - Якщо питають "на 1 unit" або "per unit", це означає ділення на кількість унікальних користувачів (COUNT DISTINCT user_id) або кількість продажів (COUNT(*)), залежно від контексту.
    - Не роби фільтр `WHERE unit = 1`, якщо цього поля немає в схемі.
    
-10. LTV (Lifetime Value):
+9. LTV (Lifetime Value):
    - Якщо запит "LTV когорти" або "найвищий LTV": використовуй SUM(gross_usd) (загальний дохід когорти), якщо не сказано "середній/average".
+
+10. ПОРІВНЯННЯ ТЕКСТУ (CASE INSENSITIVITY):
+   - Значення в базі можуть бути в різному регістрі ('Refund', 'refund', 'REFUND') або з пробілами.
+   - **ЗАВЖДИ** використовуй `TRIM(LOWER(column)) = 'значення'`, якщо не впевнений.
+   - Приклад: `WHERE TRIM(LOWER(event_type)) = 'refund'` (а не `='Refund'`).
+   - Дивись на блок "ДОСТУПНІ ЗНАЧЕННЯ В БАЗІ" вище, щоб брати правильні назви (наприклад, 'ADJCOST', 'SALES').
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
