@@ -72,9 +72,9 @@ cache_ttl = 300
 _schema_cache = {}
 _schema_time  = {}
 
-# Кеш для унікальних значень (оновлена назва змінної для примусового скидання старого кешу)
-_db_context_cache = None
-_db_context_time = 0
+# Кеш для унікальних значень (щоб не смикати базу постійно)
+_values_cache = {}
+_values_cache_time = 0
 VALUES_CACHE_TTL = 3600  # Оновлювати раз на годину
 
 # Флаг, щоб перевіряти наявність таблиці логів лише 1 раз за запуск
@@ -87,11 +87,11 @@ _log_table_checked = False
 
 def extract_account_no(text: str) -> int | None:
     m = re.search(
-        r"(?:рахун\w*|account|acct)\s*(?:№|number|#)?\s*(\d{4,10})",
+        r"(рахун(ок|к|ку|ом)?|account|acct)\s*(№|number)?\s*(\d{4,10})",
         text.lower()
     )
     if m:
-        return int(m.group(1))
+        return int(m.group(4))
     return None
 
 EVENT_TYPE_BY_INTENT = {
@@ -99,7 +99,6 @@ EVENT_TYPE_BY_INTENT = {
     "тріал": "trial",
     "subscription": "sale",
     "subscriptions": "sale",
-    "підписк": "sale", 
     "підписка": "sale",
     "підписок": "sale",
     "підписки": "sale",
@@ -169,136 +168,49 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP (SMART SCAN) ----------------
-
-def _pick_best_date_col(schema_objs, preferred):
-    """Вибирає найкращу колонку дати з доступних"""
-    name_to_type = {f["name"]: f["type"] for f in schema_objs}
-    
-    # 1. Шукаємо в списку пріоритетних
-    for c in preferred:
-        if c in name_to_type and name_to_type[c] in ("DATE", "DATETIME", "TIMESTAMP"):
-            return c, name_to_type[c]
-            
-    # 2. Якщо немає, беремо першу-ліпшу дату
-    for f in schema_objs:
-        if f["type"] in ("DATE", "DATETIME", "TIMESTAMP"):
-            return f["name"], f["type"]
-            
-    return None, None
-
-def _date_filter_expr(col_name, col_type):
-    """Повертає SQL-вираз для приведення до типу DATE"""
-    if col_type in ("TIMESTAMP", "DATETIME"):
-        return f"DATE({col_name})"
-    return col_name  # DATE
-
+# ---------------- NEW FEATURE: DATABASE CONTEXT LOOKUP ----------------
 def get_database_values_context():
     """
-    Дає контекст категоріальних значень.
-    Логіка:
-    1. Знаходить MAX(date) для кожної таблиці (щоб знати, де кінець даних).
-    2. Сканує унікальні значення ТІЛЬКИ за останні 3 дні від цієї MAX дати.
-    3. Бере тільки категоріальні колонки (без ID та метрик).
+    Витягує приклади значень з важливих текстових колонок, щоб AI не 'галюцинував'.
+    Кешується на 1 годину.
     """
-    global _db_context_cache, _db_context_time
+    global _values_cache, _values_cache_time
+    if time.time() - _values_cache_time < VALUES_CACHE_TTL and _values_cache:
+        return _values_cache
 
-    if _db_context_cache and (time.time() - _db_context_time < VALUES_CACHE_TTL):
-        return _db_context_cache 
-
-    logger.info("♻️ Refreshing DB Context (Last 3 days from MAX date)...")
-
-    # Список "категоріальних" колонок, які треба знати (все, що не ID і не цифри)
+    # Список колонок, для яких ми хочемо знати реальні значення в базі
+    # Це допомагає боту знати, що 'US' це 'US', а не 'USA'
     cols_to_scan = {
-        REVENUE_TABLE_REF: [
-            "stream", "app_name", "revenue_type", "event_type", "period", 
-            "product_name", "source_name", "provider", "legal_entity", 
-            "processing_legal_entity", "geo_country", "platform"
-        ],
-        COST_TABLE_REF: [
-            "legal_entity", "document_type", "account_name", "description", 
-            "rev_by_apps", "gen_post_type", "gen_prod_post_group", 
-            "balance_account_type", "costrev_center_code", "country_code", 
-            "mark_name_fsb", "cashflow_code", "group_for_disclosure", 
-            "source_code", "source_name", "source_type", "conso_code", "budgets_code"
-        ],
+        REVENUE_TABLE_REF: ["app_name", "geo_country", "platform", "revenue_type", "event_type"],
+        COST_TABLE_REF:    ["costrev_center_code", "account_name", "legal_entity"]
     }
 
-    preferred_date_cols = {
-        REVENUE_TABLE_REF: ["order_date", "date", "event_date", "created_at"],
-        COST_TABLE_REF: ["posting_date", "date", "transaction_date", "dt"],
-    }
-
-    allowed = {}
-    lines = ["ВАЖЛИВО: Реальні значення (TOP) в базі. Для WHERE використовуй ТІЛЬКИ їх."]
-
+    context_str = "Приклади значень у базі (використовуй їх для WHERE):\n"
+    
     for table, cols in cols_to_scan.items():
-        try:
-            schema_objs = get_table_schema(table)
-            existing = {c["name"] for c in schema_objs}
-        except Exception:
+        # Перевіряємо, чи існують колонки в схемі перед запитом
+        schema = get_table_schema(table)
+        valid_cols = [c for c in cols if _schema_has_column(schema, c)]
+        
+        if not valid_cols:
             continue
 
-        # 1. Знаходимо колонку дати
-        date_col, date_type = _pick_best_date_col(schema_objs, preferred_date_cols.get(table, []))
-        
-        # 2. Знаходимо MAX дату в таблиці
-        max_date_str = None
-        if date_col:
-            try:
-                date_expr = _date_filter_expr(date_col, date_type)
-                max_query = f"SELECT MAX({date_expr}) as md FROM `{table}`"
-                job = bq_client.query(max_query)
-                res = list(job.result())
-                if res and res[0].md:
-                    max_date_str = str(res[0].md)
-            except Exception as e:
-                logger.warning(f"Failed to get max date for {table}: {e}")
+        # Будуємо легкий запит через APPROX_TOP_COUNT (дешевше і швидше ніж DISTINCT)
+        # або просто LIMIT, якщо APPROX не підтримується для типу.
+        # Для простоти беремо DISTINCT з лімітом.
+        try:
+            for col in valid_cols:
+                sql = f"SELECT DISTINCT {col} FROM `{table}` WHERE {col} IS NOT NULL LIMIT 15"
+                job = bq_client.query(sql)
+                rows = [str(row[0]) for row in job.result()]
+                if rows:
+                    context_str += f"- {col} (в `{table.split('.')[-1]}`): {', '.join(rows)}\n"
+        except Exception as e:
+            logger.warning(f"Error fetching values for {table}: {e}")
 
-        table_short = table.split(".")[-1]
-
-        for col in cols:
-            if col not in existing: continue
-
-            try:
-                # 3. Фільтруємо за останні 3 дні від MAX дати
-                where_parts = [f"{col} IS NOT NULL"]
-                
-                if max_date_str and date_col:
-                    date_expr = _date_filter_expr(date_col, date_type)
-                    # Останні 3 дні
-                    where_parts.append(f"{date_expr} >= DATE_SUB(DATE('{max_date_str}'), INTERVAL 3 DAY)")
-                
-                where_sql = " AND ".join(where_parts)
-
-                # Беремо TOP-50 найчастіших значень за ці 3 дні
-                query = f"""
-                    SELECT CAST({col} AS STRING) AS v, COUNT(1) AS cnt
-                    FROM `{table}`
-                    WHERE {where_sql}
-                    GROUP BY v
-                    ORDER BY cnt DESC, v ASC
-                    LIMIT 50
-                """
-                job = bq_client.query(query)
-                values = [str(r["v"]) for r in job.result() if r["v"] is not None and str(r["v"]).strip() != ""]
-
-                key = f"{table_short}.{col}"
-                if values:
-                    allowed[key] = values
-                    # Для тексту - перші 15
-                    preview = ", ".join([f"'{x}'" for x in values[:15]])
-                    lines.append(f"- {key}: {preview}" + (" ..." if len(values) > 15 else ""))
-
-            except Exception as e:
-                logger.warning(f"⚠️ Context fetch error for {table}.{col}: {e}")
-
-    allowed_json = json.dumps(allowed, ensure_ascii=False)
-    context_text = "\n".join(lines)
-
-    _db_context_cache = (context_text, allowed_json, allowed)
-    _db_context_time = time.time()
-    return _db_context_cache
+    _values_cache = context_str
+    _values_cache_time = time.time()
+    return context_str
 # ----------------------------------------------------------------------
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
@@ -648,15 +560,8 @@ def generate_sql(instruction_part: str, smap) -> str:
     rev_cols = ", ".join([c["name"] for c in rev_schema]) if rev_schema else "(немає схеми REVENUE)"
     cost_cols = ", ".join([c["name"] for c in cost_schema]) if cost_schema else "(немає схеми COST)"
 
-    # >>>>> NEW: Get Top Values Context & JSON <<<<<
-    context_data = get_database_values_context()
-    
-    # Розпаковуємо значення (з обробкою, якщо функція поверне None при помилці)
-    if context_data:
-        db_context_text, allowed_values_json, _ = context_data
-    else:
-        db_context_text = "No database values loaded yet."
-        allowed_values_json = "{}"
+    # >>>>> NEW: Get real DB values to hint the LLM <<<<<
+    db_context_hint = get_database_values_context()
 
     sql_prompt = f"""
 Згенеруй BigQuery SQL для завдання.
@@ -666,10 +571,7 @@ def generate_sql(instruction_part: str, smap) -> str:
 
 {metric_hint}
 
-{db_context_text}
-
-ALLOWED_VALUES_JSON (use for exact filters):
-{allowed_values_json}
+{db_context_hint}
 
 Повні назви таблиць:
 REVENUE_TABLE = `{REVENUE_TABLE_REF}`
@@ -700,8 +602,8 @@ COST: {json.dumps(cost_schema, indent=2)}
 3. ФІЛЬТРАЦІЯ ТА ВИКЛЮЧЕННЯ (CRITICAL):
    - Якщо користувач каже "без", "крім", "exclude", "except" (наприклад "без США"), ОБОВ'ЯЗКОВО додай у WHERE умову:
      `AND column != 'value'` або `AND column NOT IN (...)`.
+   - Мапінг країн (для geo_country): "США/USA" -> 'US', "Україна" -> 'UA', "Британія" -> 'GB'.
    - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
-   - **НЕ** додавай фільтри по `app_name`, `platform`, `geo_country`, якщо користувач про це прямо не просив.
 
 4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
    - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
@@ -733,75 +635,101 @@ COST: {json.dumps(cost_schema, indent=2)}
    
 9. LTV (Lifetime Value):
    - Якщо запит "LTV когорти" або "найвищий LTV": використовуй SUM(gross_usd) (загальний дохід когорти), якщо не сказано "середній/average".
-
-10. ПОРІВНЯННЯ ТЕКСТУ (CASE INSENSITIVITY):
-   - Значення в базі можуть бути в різному регістрі ('Refund', 'refund', 'REFUND') або з пробілами.
-   - **ЗАВЖДИ** використовуй `TRIM(LOWER(column)) = 'значення'`, якщо не впевнений.
-   - Приклад: `WHERE TRIM(LOWER(event_type)) = 'refund'` (а не `='Refund'`).
-   - Дивись на блок "ДОСТУПНІ ЗНАЧЕННЯ В БАЗІ" вище, щоб брати правильні назви (наприклад, 'ADJCOST', 'SALES').
-
-11. КАТЕГОРІАЛЬНІ ФІЛЬТРИ (CRITICAL):
-   - Якщо користувач просить фільтр по країні/платформі/додатку/типу івента/провайдеру/юр.особі/центру витрат:
-     використовуй ТІЛЬКИ ці колонки:
-     • revenue: geo_country, platform, app_name, event_type, provider, revenue_type
-     • cost: legal_entity, costrev_center_code, document_type, source_code, account_name
-   - Не вигадуй значення. Бери значення ТІЛЬКИ з ALLOWED_VALUES_JSON.
-
-12. НОРМАЛІЗАЦІЯ ТА МАПІНГ (CRITICAL):
-   - Для порівнянь рядків використовуй: TRIM(LOWER(column)) = 'value_lower'
-   - Для country codes: використовуй UPPER(TRIM(column)) = 'US' / 'UA' / 'GB'
-   - Синоніми країн мап:
-     "usa", "united states", "сша" -> 'US'
-     "uk", "united kingdom", "британія" -> 'GB'
-     "ukraine", "україна" -> 'UA'
-
-13. ЯКЩО КОРИСТУВАЧ НАПИСАВ ЗНАЧЕННЯ, ЯКОГО НЕМАЄ В ALLOWED_VALUES_JSON:
-   - НЕ вигадуй "схоже" значення.
-   - Замість цього використовуй обережний пошук:
-     WHERE TRIM(LOWER(column)) LIKE '%частина_значення%'
-     (але не для geo_country — для geo_country тільки точний код).
-
-14. КІЛЬКІСТЬ (COUNT):
-   - Якщо користувач питає "скільки чарджбеків/рефандів/підписок" (кількість подій, а не сума грошей):
-     використовуй `COUNT(*)` або `COUNT(1)`.
-   - НЕ використовуй `SUM(amount)` для кількості.
-   - НЕ використовуй `COUNT(DISTINCT ...)`, якщо не просять "унікальних".
-   - Кожен рядок в таблиці = 1 подія.
-
-15. EVENT TYPES (CRITICAL):
-   - Якщо питання про "чарджбеки" -> `WHERE event_type = 'chargeback'`.
-   - Якщо питання про "рефанди" -> `WHERE event_type = 'refund'`.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
     sql = resp.text.strip()
     
-    # Cleaning
+    # Очищення SQL
     sql = sql.replace("```sql", "").replace("```", "").strip()
+    sql = re.sub(
+        r"^\s*(?:```)?\s*(?:bigquery|bigquery\s+sql|BigQuery|BigQuery\s+SQL)\s*[:\-]*\s*",
+        "",
+        sql,
+        flags=re.IGNORECASE | re.MULTILINE,)
+
+    sql = fix_window_order_by(sql)
     sql = _sanitize_sql_dates(sql, date_cols)
     sql = _sanitize_division_by_zero(sql)
-    sql = fix_window_order_by(sql)
 
-    # --- HARDCODED SAFEGUARDS ---
-    # 1. Account Number Logic
-    if (account_no is not None and year is not None and 
-        re.search(r"\b(скільки|sum|total)\b", instruction_part.lower()) and not _needs_breakdown(instruction_part)):
-        
-        date_col = next((c for c in ["posting_date", "date", "transaction_date"] if _schema_has_column(cost_schema, c)), None)
-        if date_col:
-            return f"SELECT SUM(ABS(amount_lcy)) FROM `{COST_TABLE_REF}` WHERE account_no = {account_no} AND EXTRACT(YEAR FROM {date_col}) = {year}"
+    # --- NEW FIX: Concatenated String Literals ---
+    # Якщо модель розбила текстовий рядок ('text' \n 'text'), склеюємо їх
+    sql = re.sub(r"'\s*[\r\n]+\s*'", " ", sql)
+    sql = re.sub(r'"\s*[\r\n]+\s*"', " ", sql)
 
-    # 2. Table Guard
-    if account_no is not None and REVENUE_TABLE_REF in sql:
-        raise ValueError("Помилка: Спроба шукати номер рахунку (Cost) в таблиці доходів (Revenue).")
+    # -------------------------------
+    # HARD ENFORCEMENT LOGIC
+    # -------------------------------
 
-    # 3. Cost Guard
-    if (metric in {"cost", "opex", "expense", "expenses"} or "витрат" in instruction_part.lower()) and REVENUE_TABLE_REF in sql:
-        raise ValueError("Помилка: Спроба шукати витрати в таблиці доходів.")
+    # 1. Hardcoded date logic for specific simple queries
+    if (
+        account_no is not None
+        and year is not None
+        and re.search(r"\b(скільки|sum|total)\b", instruction_part.lower())
+        and not _needs_breakdown(instruction_part)
+    ):
+        preferred = ["posting_date", "date", "dt", "transaction_date"]
+        date_col = None
+        for c in preferred:
+            if _schema_has_column(cost_schema, c):
+                date_col = c
+                break
+    
+        if not date_col:
+            raise ValueError("No date column found in COST table")
+    
+        return f"""
+        SELECT
+            SUM(ABS(amount_lcy)) AS total_expenses
+        FROM `{COST_TABLE_REF}`
+        WHERE account_no = {account_no}
+          AND DATE({date_col}) BETWEEN '{year}-01-01' AND '{year}-12-31'
+        """.strip()
 
-    # 4. Filter Injection
+    # 2. Prevent wrong table usage
+    if account_no is not None:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError("INVALID SQL: revenue table used for account-based cost query")
+    
+    
+    # 3. Cost vs Revenue table check
+    if metric in {"cost", "opex", "expense", "expenses"}:
+        if REVENUE_TABLE_REF in sql:
+            raise ValueError("INVALID SQL: revenue table used for cost metric")
+
+    # 4. Apply Hard Filters
+    
+    # FIX: Check if user wants to EXCLUDE this event type (e.g. "without refunds")
+    skip_event_filter = False
+    if re.search(r"\b(без|крім|exclude|excluding|without|виключити|прибрати|net)\b", instruction_part.lower()):
+        skip_event_filter = True
+
+    event_type = detect_event_type(instruction_part)
+    if _schema_has_column(rev_schema, "event_type"):
+        if event_type:
+            # Якщо це запит на виключення, не додаємо жорсткий фільтр
+            if not skip_event_filter:
+                if f"event_type = '{event_type}'" not in sql.lower():
+                    sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+        elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
+            sql = _ensure_where_filter(sql, "event_type = 'sale'")
+
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
+
+    # FIX: Sanitize event_type from COST tables (Hallucination fix)
+    if COST_TABLE_REF in sql:
+        # Removes "WHERE event_type = 'opex'" -> "WHERE 1=1"
+        sql = re.sub(r"WHERE\s+event_type\s*=\s*'[^']+'", "WHERE 1=1", sql, flags=re.IGNORECASE)
+        # Removes "AND event_type = 'opex'" -> ""
+        sql = re.sub(r"\bAND\s+event_type\s*=\s*'[^']+'", "", sql, flags=re.IGNORECASE)
+
+    # ПЕРЕВІРКА: Чи це взагалі SQL? (щоб уникнути помилки \320)
+    cleaned_start = sql.strip().upper()
+    if not (cleaned_start.startswith("SELECT") or cleaned_start.startswith("WITH")):
+        # Кидаємо помилку з текстом відповіді, щоб бот показав її користувачу,
+        # замість того, щоб мучити BigQuery.
+        raise ValueError(f"🤖 Відповідь AI (не SQL):\n\n{sql}")
 
     return sql
 
@@ -1052,3 +980,5 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown") ->
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
     return process_slack_message(message, smap, user_id)
+
+
