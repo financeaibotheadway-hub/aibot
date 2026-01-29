@@ -782,6 +782,10 @@ COST: {json.dumps(cost_schema, indent=2)}
    - **Допустимі типи:** `sale`, `trial`, `vat`, `wht`, `refund`, `refund_fee`, `chargeback`, `chargeback_fee`, `commission`.
    - Якщо питання про "чарджбеки" -> `WHERE event_type = 'chargeback'`.
    - Якщо питання про "рефанди" -> `WHERE event_type = 'refund'`.
+   
+16. УТОЧНЕННЯ ДЛЯ AI-АНАЛІТИКА (ВАЖЛИВО):
+   - Якщо в результатах SQL немає колонки дати (наприклад, через GROUP BY), але користувач просив конкретний рік/період:
+     вважай, що дані вже коректно відфільтровані по даті. Не кажи "Даних за цей рік немає", якщо таблиця не порожня.
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
