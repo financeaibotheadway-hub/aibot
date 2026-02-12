@@ -20,6 +20,17 @@ from vertexai.preview.generative_models import GenerativeModel
 
 from semantic_map import semantic_map
 
+# >>>>>>>>>>>> MEMORY INTEGRATION (NEW)
+# Імпортуємо модуль пам'яті. Використовуємо try/except, щоб код не падав, якщо файлу немає.
+try:
+    from memory_manager import log_query, get_similar_examples, load_learned_map
+except ImportError:
+    # Заглушки на випадок відсутності файлу
+    def log_query(q, s, r): return None
+    def get_similar_examples(q): return ""
+    def load_learned_map(): return {}
+# <<<<<<<<<<<< MEMORY INTEGRATION END
+
 # >>>>>>>>>>>> INTEGRATION (NEW)
 from analytics.metric_loader import get_metrics
 from analytics.metric_parser import detect_metric
@@ -173,7 +184,7 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# ---------------- NEW FEATURE: FAST CONTEXT SCAN (30 DAYS) ----------------
+# ---------------- NEW FEATURE: FAST CONTEXT SCAN (DISABLED) ----------------
 
 def _pick_best_date_col(schema_objs, preferred):
     # schema_objs: [{"name":..., "type":...}, ...]
@@ -196,118 +207,16 @@ def _date_filter_expr(col_name, col_type):
 
 def get_database_values_context():
     """
-    Дає контекст категоріальних значень у двох форматах:
-    1) ЛЮДСЬКИЙ текст (коротко)
-    2) JSON (жорсткий список допустимих значень для колонок)
-    Оптимізація: беремо TOP значень за частотою за останні 30 днів (швидше ніж 90).
+    PERFORMANCE FIX: 
+    Вимкнено важке сканування бази даних (Top values за 30 днів),
+    яке гальмувало відповідь бота на 10+ секунд.
+    Зараз функція повертає пустий контекст миттєво.
     """
-    global _db_context_cache, _db_context_time
+    # Якщо вам потрібно повернути контекст, розкоментуйте логіку нижче.
+    # Але для швидкості краще тримати це вимкненим.
+    
+    return "", "{}", {}
 
-    if _db_context_cache and (time.time() - _db_context_time < VALUES_CACHE_TTL):
-        return _db_context_cache  # tuple(text, allowed_json, allowed_dict)
-
-    logger.info("♻️ Refreshing DB Context (Top values, last 30 days)...")
-
-    cols_to_scan = {
-        REVENUE_TABLE_REF: [
-            "event_type",
-            "revenue_type",
-            "platform",
-            "app_name",
-            "geo_country",
-            "provider",
-        ],
-        COST_TABLE_REF: [
-            "document_type",
-            "legal_entity",
-            "costrev_center_code",
-            "source_code",
-            "account_name",
-        ],
-    }
-
-    # Пріоритетні date-колонки (щоб не брати випадковий TIMESTAMP)
-    preferred_date_cols = {
-        REVENUE_TABLE_REF: ["date", "event_date", "order_date", "created_at", "event_timestamp"],
-        COST_TABLE_REF: ["posting_date", "date", "transaction_date", "created_at"],
-    }
-
-    allowed = {}  # {"revenue_test_databot.geo_country": ["US", ...], ...}
-    lines = ["ВАЖЛИВО: Реальні значення (TOP) в базі. Для WHERE використовуй ТІЛЬКИ їх."]
-
-    for table, cols in cols_to_scan.items():
-        try:
-            schema_objs = get_table_schema(table)
-            existing = {c["name"] for c in schema_objs}
-        except Exception:
-            continue
-
-        date_col, date_type = _pick_best_date_col(schema_objs, preferred_date_cols.get(table, []))
-        date_expr = _date_filter_expr(date_col, date_type) if date_col else None
-        
-        # Знаходимо MAX дату, щоб не сканувати порожній "хвіст"
-        max_date_str = None
-        if date_col:
-            try:
-                max_query = f"SELECT MAX({date_expr}) as md FROM `{table}`"
-                job = bq_client.query(max_query)
-                res = list(job.result())
-                if res and res[0].md:
-                    max_date_str = str(res[0].md)
-            except Exception:
-                pass
-
-        table_short = table.split(".")[-1]
-
-        for col in cols:
-            if col not in existing:
-                continue
-
-            try:
-                where_parts = [f"{col} IS NOT NULL"]
-                # Якщо є MAX дата - фільтруємо за 30 днів від неї
-                if max_date_str and date_col:
-                    where_parts.append(
-                        f"{date_expr} >= DATE_SUB(DATE('{max_date_str}'), INTERVAL 30 DAY)"
-                    )
-                # Якщо немає MAX дати - беремо просто останні 30 днів від поточного часу
-                elif date_expr:
-                     where_parts.append(
-                        f"{date_expr} >= DATE_SUB(CURRENT_DATE('{LOCAL_TZ}'), INTERVAL 30 DAY)"
-                    )
-                
-                where_sql = " AND ".join(where_parts)
-
-                # TOP значення за частотою (краще ніж DISTINCT LIMIT 500)
-                query = f"""
-                    SELECT
-                      CAST({col} AS STRING) AS v,
-                      COUNT(1) AS cnt
-                    FROM `{table}`
-                    WHERE {where_sql}
-                    GROUP BY v
-                    ORDER BY cnt DESC, v ASC
-                    LIMIT 50
-                """
-                job = bq_client.query(query)
-                values = [str(r["v"]) for r in job.result() if r["v"] is not None]
-
-                key = f"{table_short}.{col}"
-                if values:
-                    allowed[key] = values
-                    # коротка версія в тексті
-                    preview = ", ".join([f"'{x}'" for x in values[:15]])
-                    lines.append(f"- {key}: {preview}" + (" ..." if len(values) > 15 else ""))
-
-            except Exception as e:
-                logger.warning(f"⚠️ Context fetch error for {table}.{col}: {e}")
-
-    allowed_json = json.dumps(allowed, ensure_ascii=False)
-    context_text = "\n".join(lines)
-
-    _db_context_cache = (context_text, allowed_json, allowed)
-    _db_context_time = time.time()
-    return _db_context_cache
 # ----------------------------------------------------------------------
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
@@ -879,7 +788,7 @@ COST: {json.dumps(cost_schema, indent=2)}
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY (INTEGRATED FIX & LOGGING)
 # ──────────────────────────────────────────────────────────────────────────────
-def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown") -> str:
+def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown"):
     start_time = time.time()
     instruction_part = instruction.strip()
     
@@ -888,6 +797,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     status = "SUCCESS"
     error_details = None
     final_response = ""
+    query_id = None
     
     TOKEN_LIMIT_MSG = (
         "⚠️ **Обмеження контексту**\n"
@@ -897,7 +807,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     try:
         if not instruction_part:
             final_response = "Повідомлення порожнє."
-            return final_response
+            return {"text": final_response, "query_id": None}
             
         if (is_trend_question(instruction_part) and not has_explicit_date(instruction_part)):
             final_response = (
@@ -907,15 +817,32 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 "• порівняння яких періодів?\n"
                 "• конкретний діапазон дат (від–до)"
             )
-            return final_response
+            return {"text": final_response, "query_id": None}
         
-        matched = find_matches_with_ai(instruction_part, smap)
+        # >>> MEMORY & RAG LOGIC START
+        # 1. Load learned semantics and merge
+        try:
+            learned_smap = load_learned_map()
+            full_smap = {**smap, **learned_smap}
+        except:
+            full_smap = smap
+
+        # 2. Get similar examples from memory
+        memory_context = get_similar_examples(instruction_part)
+        
+        # 3. Augment instruction for field matching
+        matched = find_matches_with_ai(instruction_part, full_smap) # Use full_smap here
         augmented_instruction = instruction_part
         for field, value in matched:
             augmented_instruction += f" ({field}='{value}')"
+            
+        # 4. Inject memory context into prompt
+        if memory_context:
+            augmented_instruction += f"\n\n[INTERNAL MEMORY - PREVIOUS CORRECT EXAMPLES]:\n{memory_context}\n"
+        # <<< MEMORY & RAG LOGIC END
 
         # === ГЕНЕРАЦІЯ SQL (ВСЕРЕДИНІ TRY) ===
-        generated_sql = generate_sql(augmented_instruction, smap)
+        generated_sql = generate_sql(augmented_instruction, full_smap)
 
         # === ВИКОНАННЯ ЗАПИТУ ===
         df = execute_cached_query(generated_sql)
@@ -1097,28 +1024,41 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
             status=status,
             error_msg=error_details
         )
+        
+        # >>> MEMORY SAVE (PENDING)
+        # Зберігаємо запит в історію, щоб отримати ID для кнопок
+        query_id = log_query(instruction_part, generated_sql, final_response)
+        # <<< MEMORY SAVE END
 
-    return final_response
+    # Повертаємо структуру, а не просто текст
+    return {
+        "text": final_response,
+        "query_id": query_id
+    }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINTS
 # ──────────────────────────────────────────────────────────────────────────────
-def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
+def process_slack_message(message: str, smap: dict, user_id: str = "unknown"):
     queries = split_into_separate_queries(message)
     # Фільтрація пустих запитів
     queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
 
     if not queries:
-        return "Не вдалося розпізнати запит."
+        return {"text": "Не вдалося розпізнати запит.", "query_id": None}
 
+    # Якщо один запит - повертаємо результат як є (dict з query_id)
     if len(queries) == 1:
         return execute_single_query(queries[0], smap, user_id)
         
-    out = f"📝 Знайдено {len(queries)} запитів:\n\n"
+    # Якщо декілька - комбінуємо текст, але кнопки не додаємо (складно для UI)
+    combined_text = f"📝 Знайдено {len(queries)} запитів:\n\n"
     for i, q in enumerate(queries, 1):
-        ans = execute_single_query(q, smap, user_id)
-        out += f"**Запит {i}:** {q}\n{ans}\n\n"
-    return out
+        result = execute_single_query(q, smap, user_id)
+        ans = result["text"]
+        combined_text += f"**Запит {i}:** {q}\n{ans}\n\n"
+        
+    return {"text": combined_text, "query_id": None}
 
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
