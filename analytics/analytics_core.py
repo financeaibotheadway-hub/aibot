@@ -20,17 +20,6 @@ from vertexai.preview.generative_models import GenerativeModel
 
 from semantic_map import semantic_map
 
-# >>>>>>>>>>>> MEMORY INTEGRATION (NEW)
-# Імпортуємо модуль пам'яті. Використовуємо try/except, щоб код не падав, якщо файлу немає.
-try:
-    from memory_manager import log_query, get_similar_examples, load_learned_map
-except ImportError:
-    # Заглушки на випадок відсутності файлу
-    def log_query(q, s, r): return None
-    def get_similar_examples(q): return ""
-    def load_learned_map(): return {}
-# <<<<<<<<<<<< MEMORY INTEGRATION END
-
 # >>>>>>>>>>>> INTEGRATION (NEW)
 from analytics.metric_loader import get_metrics
 from analytics.metric_parser import detect_metric
@@ -184,7 +173,7 @@ def _schema_has_column(schema_list, col_name: str) -> bool:
     col_name = col_name.lower()
     return any((c.get("name") or "").lower() == col_name for c in (schema_list or []))
 
-# ---------------- NEW FEATURE: FAST CONTEXT SCAN (DISABLED) ----------------
+# ---------------- NEW FEATURE: FAST CONTEXT SCAN (30 DAYS) ----------------
 
 def _pick_best_date_col(schema_objs, preferred):
     # schema_objs: [{"name":..., "type":...}, ...]
@@ -207,16 +196,12 @@ def _date_filter_expr(col_name, col_type):
 
 def get_database_values_context():
     """
-    PERFORMANCE FIX: 
-    Вимкнено важке сканування бази даних (Top values за 30 днів),
-    яке гальмувало відповідь бота на 10+ секунд.
-    Зараз функція повертає пустий контекст миттєво.
+    DISABLED FOR PERFORMANCE.
+    Вимкнено сканування бази, щоб бот відповідав миттєво.
     """
-    # Якщо вам потрібно повернути контекст, розкоментуйте логіку нижче.
-    # Але для швидкості краще тримати це вимкненим.
-    
+    # Повертаємо: (текст опису, json рядок, словник значень)
+    # Це пусті значення, щоб код далі не зламався, але й не ліз в базу
     return "", "{}", {}
-
 # ----------------------------------------------------------------------
 
 def _ensure_where_filter(sql: str, condition_sql: str) -> str:
@@ -788,7 +773,7 @@ COST: {json.dumps(cost_schema, indent=2)}
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTE SINGLE QUERY (INTEGRATED FIX & LOGGING)
 # ──────────────────────────────────────────────────────────────────────────────
-def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown"):
+def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown") -> str:
     start_time = time.time()
     instruction_part = instruction.strip()
     
@@ -797,7 +782,6 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     status = "SUCCESS"
     error_details = None
     final_response = ""
-    query_id = None
     
     TOKEN_LIMIT_MSG = (
         "⚠️ **Обмеження контексту**\n"
@@ -807,7 +791,7 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
     try:
         if not instruction_part:
             final_response = "Повідомлення порожнє."
-            return {"text": final_response, "query_id": None}
+            return final_response
             
         if (is_trend_question(instruction_part) and not has_explicit_date(instruction_part)):
             final_response = (
@@ -817,32 +801,15 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 "• порівняння яких періодів?\n"
                 "• конкретний діапазон дат (від–до)"
             )
-            return {"text": final_response, "query_id": None}
+            return final_response
         
-        # >>> MEMORY & RAG LOGIC START
-        # 1. Load learned semantics and merge
-        try:
-            learned_smap = load_learned_map()
-            full_smap = {**smap, **learned_smap}
-        except:
-            full_smap = smap
-
-        # 2. Get similar examples from memory
-        memory_context = get_similar_examples(instruction_part)
-        
-        # 3. Augment instruction for field matching
-        matched = find_matches_with_ai(instruction_part, full_smap) # Use full_smap here
+        matched = find_matches_with_ai(instruction_part, smap)
         augmented_instruction = instruction_part
         for field, value in matched:
             augmented_instruction += f" ({field}='{value}')"
-            
-        # 4. Inject memory context into prompt
-        if memory_context:
-            augmented_instruction += f"\n\n[INTERNAL MEMORY - PREVIOUS CORRECT EXAMPLES]:\n{memory_context}\n"
-        # <<< MEMORY & RAG LOGIC END
 
         # === ГЕНЕРАЦІЯ SQL (ВСЕРЕДИНІ TRY) ===
-        generated_sql = generate_sql(augmented_instruction, full_smap)
+        generated_sql = generate_sql(augmented_instruction, smap)
 
         # === ВИКОНАННЯ ЗАПИТУ ===
         df = execute_cached_query(generated_sql)
@@ -1024,41 +991,28 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
             status=status,
             error_msg=error_details
         )
-        
-        # >>> MEMORY SAVE (PENDING)
-        # Зберігаємо запит в історію, щоб отримати ID для кнопок
-        query_id = log_query(instruction_part, generated_sql, final_response)
-        # <<< MEMORY SAVE END
 
-    # Повертаємо структуру, а не просто текст
-    return {
-        "text": final_response,
-        "query_id": query_id
-    }
+    return final_response
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINTS
 # ──────────────────────────────────────────────────────────────────────────────
-def process_slack_message(message: str, smap: dict, user_id: str = "unknown"):
+def process_slack_message(message: str, smap: dict, user_id: str = "unknown") -> str:
     queries = split_into_separate_queries(message)
     # Фільтрація пустих запитів
     queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
 
     if not queries:
-        return {"text": "Не вдалося розпізнати запит.", "query_id": None}
+        return "Не вдалося розпізнати запит."
 
-    # Якщо один запит - повертаємо результат як є (dict з query_id)
     if len(queries) == 1:
         return execute_single_query(queries[0], smap, user_id)
         
-    # Якщо декілька - комбінуємо текст, але кнопки не додаємо (складно для UI)
-    combined_text = f"📝 Знайдено {len(queries)} запитів:\n\n"
+    out = f"📝 Знайдено {len(queries)} запитів:\n\n"
     for i, q in enumerate(queries, 1):
-        result = execute_single_query(q, smap, user_id)
-        ans = result["text"]
-        combined_text += f"**Запит {i}:** {q}\n{ans}\n\n"
-        
-    return {"text": combined_text, "query_id": None}
+        ans = execute_single_query(q, smap, user_id)
+        out += f"**Запит {i}:** {q}\n{ans}\n\n"
+    return out
 
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or semantic_map
