@@ -223,5 +223,3 @@ async def handle_event(req: Request):
         )
 
     return JSONResponse(content={"ok": True})
-
-
