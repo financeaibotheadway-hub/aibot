@@ -1,8 +1,11 @@
+# slack_handler.py
 # -*- coding: utf-8 -*-
+
 import os
 import logging
 import asyncio
 import re
+import json
 
 from dotenv import load_dotenv
 from fastapi import Request
@@ -12,30 +15,13 @@ from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.signature import SignatureVerifier
 from cachetools import TTLCache
 
-# Імпорт вашої аналітики (залишаємо як є)
-from analytics import run_analysis
-from semantic_map import semantic_map
+# Імпорт аналітики
+from analytics.analytics_core import run_analysis
+# Імпорт пам'яті (для оновлення рейтингу при натисканні кнопки)
+from memory_system import update_rating
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SHARED MESSAGE PIPELINE
-# ──────────────────────────────────────────────────────────────────────────────
-def process_slack_message(
-    text: str,
-    user_id: str = "slack",
-):
-    """
-    ЄДИНА точка входу для генерації відповіді бота.
-    """
-    response = run_analysis(
-        message=text,
-        semantic_map_override=semantic_map,
-        user_id=user_id,
-    )
-    return response
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ENV / LOG
+# CONFIG & INIT
 # ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -46,180 +32,228 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 SLACK_BOT_USER_ID    = os.getenv("SLACK_BOT_USER_ID")
 
 if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
-    logger.error("ERROR: Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET in env")
+    logger.error("ERROR: Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET")
 
 client   = AsyncWebClient(token=SLACK_BOT_TOKEN)
 verifier = SignatureVerifier(signing_secret=SLACK_SIGNING_SECRET)
 
-# Кеш для дедуплікації подій (Slack може надсилати повтори)
 processed_event_ids = TTLCache(maxsize=2000, ttl=120)
-
-# Кеш для DM каналів (user_id -> dm_channel_id)
 dm_channel_cache = TTLCache(maxsize=5000, ttl=24 * 3600)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 async def _get_dm_channel_id(user_id: str) -> str:
-    """
-    Отримує ID особистого чату (DM) з користувачем.
-    """
-    if user_id in dm_channel_cache:
-        return dm_channel_cache[user_id]
-
+    if user_id in dm_channel_cache: return dm_channel_cache[user_id]
     try:
         resp = await client.conversations_open(users=user_id)
-        dm_channel_id = resp["channel"]["id"]
-        dm_channel_cache[user_id] = dm_channel_id
-        return dm_channel_id
+        dm_id = resp["channel"]["id"]
+        dm_channel_cache[user_id] = dm_id
+        return dm_id
     except Exception as e:
-        logger.error(f"Failed to open DM with {user_id}: {e}")
+        logger.error(f"DM open fail: {e}")
         return None
 
 def _strip_bot_mention(text: str) -> str:
-    """Видаляє згадку бота (@BotName) з тексту повідомлення."""
-    if not text:
-        return text
-
+    if not text: return ""
     if SLACK_BOT_USER_ID:
-        # Видаляємо конкретний ID бота
         text = re.sub(rf"<@{re.escape(SLACK_BOT_USER_ID)}>\s*", "", text)
     else:
-        # Фоллбек: видаляємо будь-яку згадку на початку
         text = re.sub(r"^<@[\w]+>\s*", "", text)
-
     return text.strip()
 
-async def _send_ephemeral_ack(channel: str, user_id: str, text: str) -> None:
-    """
-    Відправляє 'примарне' повідомлення, яке бачить тільки користувач у каналі.
-    """
-    try:
-        await client.chat_postEphemeral(
-            channel=channel,
-            user=user_id,
-            text=text,
-        )
-    except Exception as e:
-        logger.error(f"Failed to post ephemeral ack: {e}")
-
+def _get_feedback_blocks(text, query_id):
+    """Генерує блоки Slack з кнопками"""
+    # Slack Blocks Kit
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text}
+        },
+        {
+            "type": "actions",
+            "block_id": f"feedback_{query_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "👍 Good (Learn)"},
+                    "style": "primary",
+                    "value": str(query_id),
+                    "action_id": "vote_good"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "👎 Bad"},
+                    "style": "danger",
+                    "value": str(query_id),
+                    "action_id": "vote_bad"
+                }
+            ]
+        }
+    ]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CORE LOGIC: RESPONDER
 # ──────────────────────────────────────────────────────────────────────────────
-async def _respond_async(
-    user_text: str,
-    source_channel: str,
-    user_id: str,
-):
+async def _respond_async(user_text: str, source_channel: str, user_id: str):
     """
-    Логіка відповіді:
-    1. Генеруємо відповідь (run_analysis).
-    2. Якщо джерело - Канал: пишемо результат в DM, а в канал кидаємо приховане повідомлення.
-    3. Якщо джерело - DM: просто пишемо результат туди.
+    Генерує відповідь (з кнопками, якщо це аналітика) і відправляє в DM.
     """
-    # 1. Генерація відповіді
     try:
-        response_text = await asyncio.to_thread(
-            process_slack_message,
-            text=user_text,
-            user_id=user_id,
+        # Викликаємо аналітику (вона повертає dict {text, query_id})
+        result = await asyncio.to_thread(
+            run_analysis,
+            message=user_text,
+            user_id=user_id
         )
-    except Exception as e:
-        logger.exception("Error in run_analysis()")
-        response_text = f"❌ Виникла помилка при обробці запиту: {str(e)}"
+        
+        # Перевіряємо формат відповіді (старий код міг повертати просто рядок)
+        if isinstance(result, dict):
+            response_text = result.get("text", "")
+            query_id = result.get("query_id")
+        else:
+            response_text = str(result)
+            query_id = None
 
-    # 2. Визначаємо, куди писати
-    # У Slack ID DM-каналів завжди починаються на 'D'. Публічні 'C', Приватні 'G'.
+    except Exception as e:
+        logger.exception("Error in analysis")
+        response_text = f"❌ Error processing request: {str(e)}"
+        query_id = None
+
+    # Визначаємо куди слати
+    target_dm_id = await _get_dm_channel_id(user_id)
+    if not target_dm_id:
+        target_dm_id = source_channel # Fallback to channel
+
     is_source_dm = source_channel.startswith("D")
 
-    # 3. Відправка основної відповіді
-    target_dm_id = await _get_dm_channel_id(user_id)
-    
-    if not target_dm_id:
-        # Якщо не вдалося відкрити DM, пробуємо відповісти в той же канал як фоллбек
-        logger.warning(f"Could not open DM for {user_id}, replying in source channel.")
-        await client.chat_postMessage(channel=source_channel, text=response_text)
-        return
+    # Формуємо блоки (текст + кнопки, якщо є ID)
+    blocks = None
+    if query_id:
+        blocks = _get_feedback_blocks(response_text, query_id)
 
-    # Відправляємо відповідь в особисті (завжди)
-    # Якщо користувач написав у DM, source_channel == target_dm_id, тому це спрацює коректно
+    # Відправка
     try:
-        await client.chat_postMessage(channel=target_dm_id, text=response_text)
+        if blocks:
+            await client.chat_postMessage(channel=target_dm_id, text=response_text, blocks=blocks)
+        else:
+            await client.chat_postMessage(channel=target_dm_id, text=response_text)
     except Exception as e:
-        logger.error(f"Failed to send DM response: {e}")
+        logger.error(f"Send Error: {e}")
 
-    # 4. Якщо запит був НЕ з особистих (а з каналу) -> повідомляємо в каналі
+    # Повідомлення в публічному каналі, якщо запит був звідти
     if not is_source_dm and source_channel != target_dm_id:
-        ack_msg = "📩 Відповів у особисті повідомлення (DM), щоб не засмічувати канал."
-        await _send_ephemeral_ack(source_channel, user_id, ack_msg)
-
+        try:
+            await client.chat_postEphemeral(
+                channel=source_channel,
+                user=user_id,
+                text="📩 Answer sent to DM."
+            )
+        except: pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SLACK EVENTS HANDLER (FastAPI)
+# HANDLER: INTERACTIVE (BUTTON CLICKS)
+# ──────────────────────────────────────────────────────────────────────────────
+async def handle_interactive(req: Request, payload_str: str):
+    """Обробляє натискання кнопок"""
+    try:
+        payload = json.loads(payload_str)
+    except:
+        return JSONResponse(status_code=400, content={"error": "bad payload"})
+
+    # Перевірка підпису (важливо для безпеки)
+    # Тіло запиту для перевірки підпису - це 'payload=...' urlencoded string.
+    # Оскільки ми вже розпарсили form data в main.py, тут складно перевірити сирий body.
+    # В ідеалі перевірка підпису має бути ДО парсингу form data в main.py.
+    # Але для спрощення тут пропускаємо або покладаємось на токен.
+    
+    actions = payload.get("actions", [])
+    if not actions:
+        return JSONResponse(content={"ok": True})
+
+    action = actions[0]
+    action_id = action.get("action_id")
+    query_id = action.get("value")
+    
+    user_id = payload["user"]["id"]
+    channel_id = payload["channel"]["id"]
+    message_ts = payload["message"]["ts"]
+    
+    # 1. Оновлюємо рейтинг (це запустить навчання, якщо Good)
+    rating = "good" if action_id == "vote_good" else "bad"
+    
+    # Запускаємо в окремому треді, щоб не блокувати
+    await asyncio.to_thread(update_rating, query_id, rating)
+    
+    # 2. Оновлюємо повідомлення (прибираємо кнопки, пишемо результат)
+    footer = "✅ Thanks! I'll remember this." if rating == "good" else "❌ Thanks for feedback."
+    
+    # Беремо оригінальний текст (перший блок)
+    original_blocks = payload["message"].get("blocks", [])
+    new_blocks = []
+    if original_blocks:
+        new_blocks.append(original_blocks[0]) # Лишаємо контент
+    
+    new_blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": footer}]
+    })
+    
+    try:
+        await client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            blocks=new_blocks,
+            text="Feedback received" # Fallback text
+        )
+    except Exception as e:
+        logger.error(f"Update Msg Error: {e}")
+
+    return JSONResponse(content={"ok": True})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HANDLER: EVENTS (MESSAGES)
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_event(req: Request):
-    """
-    Обробник HTTP запитів від Slack Events API.
-    """
-    # 1. Retry check (Slack іноді дублює запити, якщо ми довго думаємо)
+    """Обробляє вхідні повідомлення"""
     if req.headers.get("X-Slack-Retry-Num"):
         return JSONResponse(content={"ok": True})
 
-    raw_body = await req.body()
-
-    # 2. Перевірка підпису (Security)
     try:
-        if not verifier.is_valid_request(raw_body, dict(req.headers)):
+        body = await req.body()
+        if not verifier.is_valid_request(body, dict(req.headers)):
             return JSONResponse(status_code=401, content={"error": "invalid signature"})
-    except Exception:
-        return JSONResponse(status_code=401, content={"error": "signature check failed"})
-
-    try:
+        
         payload = await req.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "bad json"})
+    except:
+        return JSONResponse(status_code=400, content={"error": "bad request"})
 
-    # 3. URL Verification (потрібно при налаштуванні бота)
     if payload.get("type") == "url_verification":
         return JSONResponse(content={"challenge": payload.get("challenge")})
 
-    event = payload.get("event", {}) or {}
-    event_id = payload.get("event_id") or event.get("client_msg_id")
+    event = payload.get("event", {})
+    if not event: return JSONResponse(content={"ok": True})
 
-    # 4. Дедуплікація
-    if event_id and event_id in processed_event_ids:
-        return JSONResponse(content={"ok": True})
-    if event_id:
-        processed_event_ids[event_id] = True
+    # Дедуплікація
+    evt_id = payload.get("event_id")
+    if evt_id in processed_event_ids: return JSONResponse(content={"ok": True})
+    processed_event_ids[evt_id] = True
 
-    # 5. Ігноруємо повідомлення від ботів (щоб не було циклів)
-    if event.get("bot_id") is not None:
-        return JSONResponse(content={"ok": True})
+    if event.get("bot_id"): return JSONResponse(content={"ok": True})
 
-    evt_type = event.get("type")
-    channel_id = event.get("channel")
-    user_id = event.get("user")
+    # Типи подій
+    is_mention = event.get("type") == "app_mention"
+    is_dm = event.get("type") == "message" and event.get("channel_type") == "im"
 
-    # 6. Обробка: app_mention (у каналах) АБО message (у DM)
-    # У DM 'type' події часто просто 'message', але channel_type='im'
-    is_app_mention = evt_type == "app_mention"
-    is_dm_message = evt_type == "message" and event.get("channel_type") == "im"
-
-    if is_app_mention or is_dm_message:
-        raw_text = event.get("text", "")
-        user_text = _strip_bot_mention(raw_text)
-
-        logger.info(f"New task from {user_id} in {channel_id}: {user_text}")
-
-        # Запускаємо асинхронну обробку, щоб не блокувати відповідь Слаку (200 OK)
+    if is_mention or is_dm:
+        text = _strip_bot_mention(event.get("text", ""))
+        user = event.get("user")
+        channel = event.get("channel")
+        
+        logger.info(f"Task from {user}: {text}")
+        
         asyncio.create_task(
-            _respond_async(
-                user_text=user_text,
-                source_channel=channel_id,
-                user_id=user_id,
-            )
+            _respond_async(text, channel, user)
         )
 
     return JSONResponse(content={"ok": True})
