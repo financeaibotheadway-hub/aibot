@@ -1058,5 +1058,6 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown"):
     return {"text": combined_text, "query_id": None}
 
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
-    smap = semantic_map_override or semantic_map
+    smap = semantic_map_override or get_semantic_map()
+    return process_slack_message(message, smap, user_id)
     return process_slack_message(message, smap, user_id)
