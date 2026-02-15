@@ -1,70 +1,6 @@
-Homepage
-Primary navigation
-Project
-F
-Finance AI Bot
-
-Pinned
-
-Manage
-
-Plan
-
-Automate
-
-Code
-
-Build
-
-Secure
-
-Deploy
-
-Operate
-
-Monitor
-
-Analyze
-avatarHeadway Inc
-Operations
-Finance AI Bot
-Your account is authenticated with SSO or SAML. To push and pull over HTTPS with Git using this account, you must set a password or set up a personal access token to use instead of a password.
-Files
-anal
-‎ytics‎
-te
-‎sts‎
-.gitlab
-‎-ci.yml‎
-Docke
-‎rfile‎
-READ
-‎ME.md‎
-entryp
-‎oint.py‎
-mai
-‎n.py‎
-memory_s
-‎ystem.py‎
-requirem
-‎ents.txt‎
-semanti
-‎c_map.py‎
-slack_ha
-‎ndler.py‎
-finance-ai-bot
-memory_system.py
-memory_system.py
-Finance Bot AI's avatar
-Add new file [!6]
-Finance Bot AI authored 19 minutes ago
-c1559ed0
- Code owners
-Assign users and groups as approvers for specific file changes. Learn more.
-memory_system.py
-4.28 KiB
 # memory_system.py
 # -*- coding: utf-8 -*-
+
 import os
 import uuid
 import difflib
@@ -74,11 +10,15 @@ from datetime import datetime
 from google.cloud import bigquery
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
+
 from semantic_map import add_term_to_map, get_semantic_map
+
 BQ_PROJECT = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
 BQ_DATASET = os.getenv("BQ_DATASET", "uploads")
 BQ_MEMORY_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.bot_memory"
+
 bq_client = bigquery.Client(project=BQ_PROJECT)
+
 def log_query_to_memory(user_query, sql, response_text):
     """Зберігає запит як 'pending'"""
     query_id = str(uuid.uuid4())[:8]
@@ -95,6 +35,7 @@ def log_query_to_memory(user_query, sql, response_text):
     except Exception as e:
         print(f"Memory Log Error: {e}")
     return query_id
+
 def update_rating(query_id, rating):
     """
     Оновлює оцінку. Якщо Good -> запускає навчання.
@@ -118,6 +59,7 @@ def update_rating(query_id, rating):
                 _learn_semantics(rows[0].query, rows[0].sql)
     except Exception as e:
         print(f"Rating Update Error: {e}")
+
 def find_exact_match(user_query):
     """Перевіряє, чи є такий успішний запит в базі"""
     sql = f"""
@@ -133,6 +75,7 @@ def find_exact_match(user_query):
         if rows: return rows[0].sql
     except: pass
     return None
+
 def find_similar_matches(user_query):
     """Шукає схожі запити (Top-3)"""
     try:
@@ -148,6 +91,7 @@ def find_similar_matches(user_query):
         
         return "\n---\n".join(list(set(found))[:3])
     except: return ""
+
 def _learn_semantics(user_query, sql):
     """AI Агент: шукає нові слова і пише їх в мапу"""
     print(f"🎓 Learning from: {user_query}")
