@@ -17,7 +17,7 @@ from cachetools import TTLCache
 
 # Імпорт аналітики
 from analytics.analytics_core import run_analysis
-# Імпорт пам'яті (для оновлення рейтингу при натисканні кнопки)
+# Імпорт пам'яті
 from memory_system import update_rating
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -64,7 +64,6 @@ def _strip_bot_mention(text: str) -> str:
 
 def _get_feedback_blocks(text, query_id):
     """Генерує блоки Slack з кнопками"""
-    # Slack Blocks Kit
     return [
         {
             "type": "section",
@@ -100,14 +99,12 @@ async def _respond_async(user_text: str, source_channel: str, user_id: str):
     Генерує відповідь (з кнопками, якщо це аналітика) і відправляє в DM.
     """
     try:
-        # Викликаємо аналітику (вона повертає dict {text, query_id})
         result = await asyncio.to_thread(
             run_analysis,
             message=user_text,
             user_id=user_id
         )
         
-        # Перевіряємо формат відповіді (старий код міг повертати просто рядок)
         if isinstance(result, dict):
             response_text = result.get("text", "")
             query_id = result.get("query_id")
@@ -120,28 +117,37 @@ async def _respond_async(user_text: str, source_channel: str, user_id: str):
         response_text = f"❌ Error processing request: {str(e)}"
         query_id = None
 
-    # Визначаємо куди слати
     target_dm_id = await _get_dm_channel_id(user_id)
     if not target_dm_id:
-        target_dm_id = source_channel # Fallback to channel
+        target_dm_id = source_channel 
 
     is_source_dm = source_channel.startswith("D")
 
-    # Формуємо блоки (текст + кнопки, якщо є ID)
-    blocks = None
-    if query_id:
-        blocks = _get_feedback_blocks(response_text, query_id)
-
-    # Відправка
+    # 🔥 FIX ДЛЯ ДОВГИХ ПОВІДОМЛЕНЬ 🔥
+    # Slack Blocks мають ліміт 3000 символів. Якщо більше - шлемо просто текстом.
     try:
-        if blocks:
-            await client.chat_postMessage(channel=target_dm_id, text=response_text, blocks=blocks)
-        else:
+        if len(response_text) > 2900:
+            logger.warning("Response too long for blocks (buttons), sending as plain text.")
+            # Відправляємо просто текст (до 40 000 символів), але без кнопок
             await client.chat_postMessage(channel=target_dm_id, text=response_text)
+        
+        elif query_id:
+            # Якщо влазить в ліміт - додаємо кнопки
+            blocks = _get_feedback_blocks(response_text, query_id)
+            await client.chat_postMessage(channel=target_dm_id, text=response_text, blocks=blocks)
+        
+        else:
+            # Звичайна відповідь
+            await client.chat_postMessage(channel=target_dm_id, text=response_text)
+            
     except Exception as e:
         logger.error(f"Send Error: {e}")
+        # Спроба відправити хоча б помилку юзеру
+        try:
+            await client.chat_postMessage(channel=target_dm_id, text=f"⚠️ Error sending full response: {e}")
+        except: pass
 
-    # Повідомлення в публічному каналі, якщо запит був звідти
+    # Повідомлення в публічному каналі
     if not is_source_dm and source_channel != target_dm_id:
         try:
             await client.chat_postEphemeral(
@@ -161,12 +167,6 @@ async def handle_interactive(req: Request, payload_str: str):
     except:
         return JSONResponse(status_code=400, content={"error": "bad payload"})
 
-    # Перевірка підпису (важливо для безпеки)
-    # Тіло запиту для перевірки підпису - це 'payload=...' urlencoded string.
-    # Оскільки ми вже розпарсили form data в main.py, тут складно перевірити сирий body.
-    # В ідеалі перевірка підпису має бути ДО парсингу form data в main.py.
-    # Але для спрощення тут пропускаємо або покладаємось на токен.
-    
     actions = payload.get("actions", [])
     if not actions:
         return JSONResponse(content={"ok": True})
@@ -175,39 +175,59 @@ async def handle_interactive(req: Request, payload_str: str):
     action_id = action.get("action_id")
     query_id = action.get("value")
     
-    user_id = payload["user"]["id"]
-    channel_id = payload["channel"]["id"]
-    message_ts = payload["message"]["ts"]
+    user_data = payload.get("user", {})
+    channel_data = payload.get("channel", {})
+    message_data = payload.get("message", {})
+
+    channel_id = channel_data.get("id")
+    message_ts = message_data.get("ts")
     
-    # 1. Оновлюємо рейтинг (це запустить навчання, якщо Good)
+    if not (channel_id and message_ts):
+        return JSONResponse(status_code=400, content={"error": "missing context"})
+
     rating = "good" if action_id == "vote_good" else "bad"
     
-    # Запускаємо в окремому треді, щоб не блокувати
-    await asyncio.to_thread(update_rating, query_id, rating)
-    
-    # 2. Оновлюємо повідомлення (прибираємо кнопки, пишемо результат)
+    # Спроба запису в БД (ігноруємо помилки прав доступу, щоб не було 500)
+    if query_id and query_id != "None":
+        try:
+            await asyncio.to_thread(update_rating, query_id, rating)
+            logger.info(f"Rating updated: {rating}")
+        except Exception as e:
+            logger.error(f"Failed to update rating (DB error): {e}")
+
+    # Оновлення повідомлення
     footer = "✅ Thanks! I'll remember this." if rating == "good" else "❌ Thanks for feedback."
     
-    # Беремо оригінальний текст (перший блок)
-    original_blocks = payload["message"].get("blocks", [])
+    # Беремо оригінальний текст (перший блок), якщо він є
+    original_blocks = message_data.get("blocks", [])
     new_blocks = []
+    
+    # Якщо оригінальне повідомлення було блоками
     if original_blocks:
-        new_blocks.append(original_blocks[0]) # Лишаємо контент
-    
-    new_blocks.append({
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": footer}]
-    })
-    
-    try:
-        await client.chat_update(
-            channel=channel_id,
-            ts=message_ts,
-            blocks=new_blocks,
-            text="Feedback received" # Fallback text
-        )
-    except Exception as e:
-        logger.error(f"Update Msg Error: {e}")
+        new_blocks.append(original_blocks[0])
+        new_blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": footer}]
+        })
+        try:
+            await client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=new_blocks,
+                text="Feedback received"
+            )
+        except Exception as e:
+            logger.error(f"Update Msg Error: {e}")
+    else:
+        # Якщо оригінал був plain text (через ліміт), ми не можемо його оновити на блоки легко
+        # Просто постимо ephemeral підтвердження
+        try:
+            await client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_data.get("id"),
+                text=footer
+            )
+        except: pass
 
     return JSONResponse(content={"ok": True})
 
@@ -215,7 +235,6 @@ async def handle_interactive(req: Request, payload_str: str):
 # HANDLER: EVENTS (MESSAGES)
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_event(req: Request):
-    """Обробляє вхідні повідомлення"""
     if req.headers.get("X-Slack-Retry-Num"):
         return JSONResponse(content={"ok": True})
 
@@ -234,14 +253,12 @@ async def handle_event(req: Request):
     event = payload.get("event", {})
     if not event: return JSONResponse(content={"ok": True})
 
-    # Дедуплікація
     evt_id = payload.get("event_id")
     if evt_id in processed_event_ids: return JSONResponse(content={"ok": True})
     processed_event_ids[evt_id] = True
 
     if event.get("bot_id"): return JSONResponse(content={"ok": True})
 
-    # Типи подій
     is_mention = event.get("type") == "app_mention"
     is_dm = event.get("type") == "message" and event.get("channel_type") == "im"
 
@@ -249,6 +266,11 @@ async def handle_event(req: Request):
         text = _strip_bot_mention(event.get("text", ""))
         user = event.get("user")
         channel = event.get("channel")
+
+        # 🔥 FIX: Ігноруємо події без юзера (щоб не було помилок в логах)
+        if not user:
+            logger.warning(f"Skipping event with no user. Event type: {event.get('type')}")
+            return JSONResponse(content={"ok": True})
         
         logger.info(f"Task from {user}: {text}")
         
