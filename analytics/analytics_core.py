@@ -617,10 +617,11 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Приклад: "Топ 3 країни без США" -> `WHERE geo_country != 'US' ORDER BY revenue DESC LIMIT 3`.
    - **НЕ** додавай фільтри по `app_name`, `platform`, `geo_country`, якщо користувач про це прямо не просив.
 
-4. ФІЛЬТРАЦІЯ ПО ТЕКСТУ (account_name):
-   - Використовуй 'Приклади значень у базі', надані вище, щоб знати точне написання.
-   - Для категорій витрат використовуй `WHERE account_name LIKE '%Назва%'` в таблиці COST.
-   - Для "офісів" (office): використовуй `LOWER(costrev_center_code) LIKE '%office%'` (без врахування регістру).
+4. АНАЛІЗ ВИТРАТ (CRITICAL):
+   - **ЗАВЖДИ** використовуй `account_name` для аналізу "видів витрат" або "категорій витрат". Це головне поле!
+   - Якщо користувач питає "топ витрат", "структура витрат", "breakdown of costs" - роби `GROUP BY account_name`.
+   - Інші важливі поля для аналізу витрат: `subproject_code`, `balance_account_type`.
+   - ⚠️ **ВАЖЛИВО:** Використовуй `costrev_center_code` ТІЛЬКИ якщо користувач прямо написав "по центрах витрат", "cost centers" або "costrev_center_code". В інших випадках ігноруй це поле.
 
 5. ТРЕНДИ ТА CTE:
    - Якщо використовуєш WITH (CTE), запит ПОВИНЕН бути завершеним.
@@ -658,7 +659,7 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо користувач просить фільтр по країні/платформі/додатку/типу івента/провайдеру/юр.особі/центру витрат:
      використовуй ТІЛЬКИ ці колонки:
      • revenue: geo_country, platform, app_name, event_type, provider, revenue_type
-     • cost: legal_entity, costrev_center_code, document_type, source_code, account_name
+     • cost: legal_entity, costrev_center_code, document_type, source_code, account_name, subproject_code, balance_account_type
    - Не вигадуй значення. Бери значення ТІЛЬКИ з ALLOWED_VALUES_JSON.
 
 12. НОРМАЛІЗАЦІЯ ТА МАПІНГ (CRITICAL):
@@ -690,6 +691,11 @@ COST: {json.dumps(cost_schema, indent=2)}
 16. УТОЧНЕННЯ ДЛЯ AI-АНАЛІТИКА (ВАЖЛИВО):
    - Якщо в результатах SQL немає колонки дати (наприклад, через GROUP BY), але користувач просив конкретний рік/період:
      вважай, що дані вже коректно відфільтровані по даті. Не кажи "Даних за цей рік немає", якщо таблиця не порожня.
+     
+17. ПРІОРИТЕТИ ДЛЯ ВИТРАТ (COST TABLE):
+    - Головне поле для групування витрат - `account_name`.
+    - Якщо користувач просить "топ-3 статті витрат", це означає `SELECT account_name, SUM(...) ... GROUP BY account_name ORDER BY ... DESC LIMIT 3`.
+    - Якщо `account_name` пустий (None) - назви цю групу "Uncategorized" або "Нерозподілені витрати".
 """
 
     resp = model.generate_content(sql_prompt, generation_config={"temperature": 0})
@@ -819,14 +825,24 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         full_smap = get_semantic_map()
 
         # 2. Шукаємо точний збіг в пам'яті
-        cached_sql = find_exact_match(instruction_part)
+        cached_sql = None
+        
+        try:
+             cached_sql = find_exact_match(instruction_part)
+        except Exception:
+             # logger.warning("Memory read failed (likely permissions), skipping exact match")
+             pass
         
         if cached_sql:
             logger.info("⚡ FOUND EXACT MATCH IN MEMORY! Re-using SQL.")
             generated_sql = cached_sql
         else:
             # 3. Шукаємо схожі запити (RAG)
-            memory_context = find_similar_matches(instruction_part)
+            memory_context = ""
+            try:
+                memory_context = find_similar_matches(instruction_part)
+            except Exception:
+                pass
             
             # 4. Формуємо промпт з контекстом
             matched = find_matches_with_ai(instruction_part, full_smap)
@@ -845,7 +861,17 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         df = execute_cached_query(generated_sql)
 
         if df.empty:
-            final_response = "Результат порожній."
+            # 🔥 FIX: Пояснення, якщо результат порожній і немає дати
+            if not has_explicit_date(instruction_part):
+                final_response = (
+                    "🕵️ **Результат порожній.**\n\n"
+                    "Схоже, я не знайшов даних. Це часто буває, коли не вказано часовий період.\n\n"
+                    "💡 **Будь ласка, уточніть:**\n"
+                    "• Вкажіть дату (наприклад: *'за січень 2023'*, *'за 2024 рік'*)\n"
+                    "• Або напишіть *'за весь час'*, якщо хочете загальну статистику."
+                )
+            else:
+                final_response = "Результат порожній (0 рядків). За цей період даних не знайдено."
         else:
             if len(df.columns) == 1 and str(df.columns[0]).startswith("f0_"):
                 df = df.rename(columns={df.columns[0]: "value"})
@@ -1022,9 +1048,13 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
             error_msg=error_details
         )
         
-        # >>> MEMORY SAVE (PENDING)
-        # Зберігаємо запит в історію, щоб отримати ID для кнопок
-        query_id = log_query_to_memory(instruction_part, generated_sql, final_response)
+        # >>> MEMORY SAVE (SAFE MODE)
+        try:
+             # Зберігаємо запит в історію, щоб отримати ID для кнопок
+             query_id = log_query_to_memory(instruction_part, generated_sql, final_response)
+        except Exception as e:
+             logger.error(f"Failed to save to memory (likely permissions): {e}")
+             query_id = None
         # <<< MEMORY SAVE END
 
     # Повертаємо структуру, а не просто текст
@@ -1059,5 +1089,4 @@ def process_slack_message(message: str, smap: dict, user_id: str = "unknown"):
 
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
     smap = semantic_map_override or get_semantic_map()
-    return process_slack_message(message, smap, user_id)
     return process_slack_message(message, smap, user_id)
