@@ -1,270 +1,147 @@
-# slack_handler.py
+# semantic_map.py
 # -*- coding: utf-8 -*-
 
 import os
-import logging
-import asyncio
-import re
+import time
 import json
+from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 
-from dotenv import load_dotenv
-from fastapi import Request
-from fastapi.responses import JSONResponse
+# Налаштування BigQuery
+BQ_PROJECT = os.getenv("BIGQUERY_PROJECT", "finance-ai-bot-headway")
+BQ_DATASET = os.getenv("BQ_DATASET", "uploads")
+BQ_MAP_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.semantic_map_dynamic"
 
-from slack_sdk.web.async_client import AsyncWebClient
-from slack_sdk.signature import SignatureVerifier
-from cachetools import TTLCache
+bq_client = bigquery.Client(project=BQ_PROJECT)
 
-# Імпорт аналітики
-from analytics.analytics_core import run_analysis
-# Імпорт пам'яті (для оновлення рейтингу при натисканні кнопки)
-from memory_system import update_rating
+# Кеш, щоб не смикати базу постійно (оновлюється раз на 10 хв)
+_map_cache = None
+_map_cache_time = 0
+CACHE_TTL = 600
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONFIG & INIT
-# ──────────────────────────────────────────────────────────────────────────────
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("slack")
+# =========================================================
+# 1. СТАТИЧНА КАРТА (Ваша база)
+# =========================================================
+STATIC_MAP = {
+    "stream:Web": ["web", "веб", "сайт", "w0"],
+    "stream:iOS": ["ioc", "ios", "епл", "на еплі", "айос"],
+    "stream:Android": ["андроїд", "android", "андройд", "гугл", "gp"],
 
-SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN")
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
-SLACK_BOT_USER_ID    = os.getenv("SLACK_BOT_USER_ID")
+    "app_name:impulse": ["імпульс", "impulse"],
+    "app_name:headway": ["хедвей", "headway"],
+    "app_name:skillsta": ["скіллста", "skillsta", "скілста", "skilsta"],
+    "app_name:nibble": ["nibble", "nible", "нібл", "ніббл"],
+    "app_name:addmile": ["addmile", "admile", "едмайл", "адмайл"],
 
-if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
-    logger.error("ERROR: Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET")
+    "revenue_type:New": ["new", "нью", "нового"],
+    "revenue_type:Retained": ["retained", "ретейнд", "старий", "старого", "ретеінд"],
 
-client   = AsyncWebClient(token=SLACK_BOT_TOKEN)
-verifier = SignatureVerifier(signing_secret=SLACK_SIGNING_SECRET)
+    "event_type:commission": ["комісії", "commission", "комісія"],
+    "event_type:sale": [
+        {"text": "продажі", "w": 1.0}, {"text": "сейл", "w": 1.0}, 
+        {"text": "сейлзи", "w": 1.0}, {"text": "sale", "w": 1.0}, 
+        {"text": "ревенью", "w": 1.0}
+    ],
+    "event_type:trial": ["тріал", "тряал", "trial", "трайал"],
+    "event_type:refund": [
+        {"text": "рефанд", "w": 1.0}, {"text": "refund", "w": 1.0}, "повернення"
+    ],
+    "event_type:chargeback": [
+        {"text": "чарджбек", "w": 1.0}, {"text": "chargeback", "w": 1.0}, "скасування"
+    ],
+    "event_type:refund_fee": [
+        {"text": "комісія рефанд", "w": 1.0}, {"text": "refund fee", "w": 1.0}, 
+        "штраф за повернення", {"text": "рефанд фі", "w": 1.0}
+    ],
+    "event_type:chargeback_fee": ["комісія чарджбек", "chargeback fee", "штраф за скасування", "фі чарджбек"],
+    "event_type:vat": ["vat", "пдв", "ПДВ", "Податок додану вартість"],
+    "event_type:wht": ["wht", "вхт", "Пнр", "Податок на репатріацію"],
+    "event_type:opex": ["opex", "опекс", "опекси", "Операційні витрати"],
 
-processed_event_ids = TTLCache(maxsize=2000, ttl=120)
-dm_channel_cache = TTLCache(maxsize=5000, ttl=24 * 3600)
+    "processing_legal_entity:GTHW": ["GTHW", "ГТХВ"],
+    "processing_legal_entity:Milibro": ["Milibro", "Мілібро"],
+    "processing_legal_entity:Kremital": ["Kremital", "Кремітал"],
+    "processing_legal_entity:Vodelif": ["Vodelif", "Воделіф"],
+    "processing_legal_entity:Librotech": ["Librotech", "Лібротех"]
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
-async def _get_dm_channel_id(user_id: str) -> str:
-    if user_id in dm_channel_cache: return dm_channel_cache[user_id]
+# =========================================================
+# 2. ДИНАМІЧНА ЛОГІКА
+# =========================================================
+
+def _ensure_table_exists():
     try:
-        resp = await client.conversations_open(users=user_id)
-        dm_id = resp["channel"]["id"]
-        dm_channel_cache[user_id] = dm_id
-        return dm_id
+        bq_client.get_table(BQ_MAP_TABLE)
+    except NotFound:
+        # Таблиця має бути створена SQL скриптом, але про всяк випадок:
+        pass
+
+def get_semantic_map(force_refresh=False):
+    """Повертає об'єднану карту: STATIC + BIGQUERY"""
+    global _map_cache, _map_cache_time
+    
+    if not force_refresh and _map_cache and (time.time() - _map_cache_time < CACHE_TTL):
+        return _map_cache
+
+    combined_map = {k: v[:] if isinstance(v, list) else v for k, v in STATIC_MAP.items()}
+    
+    try:
+        query = f"SELECT term_key, term_value FROM `{BQ_MAP_TABLE}`"
+        rows = list(bq_client.query(query).result())
+        
+        for row in rows:
+            key = row.term_key
+            val = row.term_value
+            if key in combined_map:
+                # Перевірка на дублі
+                current_vals = combined_map[key]
+                exists = False
+                for item in current_vals:
+                    if isinstance(item, str) and item.lower() == val.lower(): exists = True
+                    elif isinstance(item, dict) and item.get("text", "").lower() == val.lower(): exists = True
+                
+                if not exists:
+                    combined_map[key].append(val)
+            else:
+                combined_map[key] = [val]
+                
+        _map_cache = combined_map
+        _map_cache_time = time.time()
     except Exception as e:
-        logger.error(f"DM open fail: {e}")
-        return None
+        print(f"⚠️ Error loading dynamic map: {e}")
+        return combined_map
 
-def _strip_bot_mention(text: str) -> str:
-    if not text: return ""
-    if SLACK_BOT_USER_ID:
-        text = re.sub(rf"<@{re.escape(SLACK_BOT_USER_ID)}>\s*", "", text)
-    else:
-        text = re.sub(r"^<@[\w]+>\s*", "", text)
-    return text.strip()
+    return combined_map
 
-def _get_feedback_blocks(text, query_id):
-    """Генерує блоки Slack з кнопками"""
-    # Slack Blocks Kit
-    return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": text}
-        },
-        {
-            "type": "actions",
-            "block_id": f"feedback_{query_id}",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "👍 Good (Learn)"},
-                    "style": "primary",
-                    "value": str(query_id),
-                    "action_id": "vote_good"
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "👎 Bad"},
-                    "style": "danger",
-                    "value": str(query_id),
-                    "action_id": "vote_bad"
-                }
+def add_term_to_map(key, value):
+    """Додає нове слово в BigQuery"""
+    try:
+        # Перевірка дублів в базі
+        check_sql = f"SELECT count(1) as cnt FROM `{BQ_MAP_TABLE}` WHERE term_key = @key AND term_value = @val"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("key", "STRING", key),
+                bigquery.ScalarQueryParameter("val", "STRING", value)
             ]
-        }
-    ]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CORE LOGIC: RESPONDER
-# ──────────────────────────────────────────────────────────────────────────────
-async def _respond_async(user_text: str, source_channel: str, user_id: str):
-    """
-    Генерує відповідь (з кнопками, якщо це аналітика) і відправляє в DM.
-    """
-    try:
-        # Викликаємо аналітику (вона повертає dict {text, query_id})
-        result = await asyncio.to_thread(
-            run_analysis,
-            message=user_text,
-            user_id=user_id
         )
+        res = list(bq_client.query(check_sql, job_config=job_config).result())
+        if res and res[0].cnt > 0:
+            return False
+
+        rows = [{"term_key": key, "term_value": value, "created_at": time.strftime('%Y-%m-%d %H:%M:%S')}]
+        errors = bq_client.insert_rows_json(BQ_MAP_TABLE, rows)
         
-        # Перевіряємо формат відповіді
-        if isinstance(result, dict):
-            response_text = result.get("text", "")
-            query_id = result.get("query_id")
+        if not errors:
+            print(f"✅ Learned term: {key} -> {value}")
+            global _map_cache_time
+            _map_cache_time = 0 # Скидаємо кеш
+            return True
         else:
-            response_text = str(result)
-            query_id = None
-
+            print(f"❌ BQ Error: {errors}")
+            return False
     except Exception as e:
-        logger.exception("Error in analysis")
-        response_text = f"❌ Error processing request: {str(e)}"
-        query_id = None
+        print(f"❌ Exception adding term: {e}")
+        return False
 
-    # Визначаємо куди слати
-    target_dm_id = await _get_dm_channel_id(user_id)
-    if not target_dm_id:
-        target_dm_id = source_channel # Fallback to channel
-
-    is_source_dm = source_channel.startswith("D")
-
-    # Формуємо блоки (текст + кнопки, якщо є ID)
-    blocks = None
-    if query_id:
-        blocks = _get_feedback_blocks(response_text, query_id)
-
-    # Відправка
-    try:
-        if blocks:
-            await client.chat_postMessage(channel=target_dm_id, text=response_text, blocks=blocks)
-        else:
-            await client.chat_postMessage(channel=target_dm_id, text=response_text)
-    except Exception as e:
-        logger.error(f"Send Error: {e}")
-
-    # Повідомлення в публічному каналі, якщо запит був звідти
-    if not is_source_dm and source_channel != target_dm_id:
-        try:
-            await client.chat_postEphemeral(
-                channel=source_channel,
-                user=user_id,
-                text="📩 Answer sent to DM."
-            )
-        except: pass
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HANDLER: INTERACTIVE (BUTTON CLICKS)
-# ──────────────────────────────────────────────────────────────────────────────
-async def handle_interactive(req: Request, payload_str: str):
-    """Обробляє натискання кнопок"""
-    try:
-        payload = json.loads(payload_str)
-    except:
-        return JSONResponse(status_code=400, content={"error": "bad payload"})
-
-    actions = payload.get("actions", [])
-    if not actions:
-        return JSONResponse(content={"ok": True})
-
-    action = actions[0]
-    action_id = action.get("action_id")
-    query_id = action.get("value")
-    
-    # Більш безпечне отримання полів через .get()
-    user_data = payload.get("user", {})
-    channel_data = payload.get("channel", {})
-    message_data = payload.get("message", {})
-
-    user_id = user_data.get("id")
-    channel_id = channel_data.get("id")
-    message_ts = message_data.get("ts")
-    
-    if not (channel_id and message_ts):
-        logger.error("Missing channel_id or message_ts in interactive payload")
-        return JSONResponse(status_code=400, content={"error": "missing context"})
-
-    # 1. Оновлюємо рейтинг (це запустить навчання, якщо Good)
-    rating = "good" if action_id == "vote_good" else "bad"
-    
-    # 🔥 ВИПРАВЛЕНО: Обробка помилок при запису в БД
-    if query_id and query_id != "None":
-        try:
-            await asyncio.to_thread(update_rating, query_id, rating)
-            logger.info(f"Rating updated for query {query_id}: {rating}")
-        except Exception as e:
-            # Логуємо помилку, але НЕ зупиняємо виконання, щоб інтерфейс Slack оновився
-            logger.error(f"CRITICAL: Failed to update rating in DB: {e}", exc_info=True)
-    else:
-        logger.warning("Received interaction without valid query_id")
-
-    # 2. Оновлюємо повідомлення (прибираємо кнопки, пишемо результат)
-    footer = "✅ Thanks! I'll remember this." if rating == "good" else "❌ Thanks for feedback."
-    
-    # Беремо оригінальний текст (перший блок)
-    original_blocks = message_data.get("blocks", [])
-    new_blocks = []
-    if original_blocks:
-        new_blocks.append(original_blocks[0]) # Лишаємо контент
-    
-    new_blocks.append({
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": footer}]
-    })
-    
-    try:
-        await client.chat_update(
-            channel=channel_id,
-            ts=message_ts,
-            blocks=new_blocks,
-            text="Feedback received" # Fallback text
-        )
-    except Exception as e:
-        logger.error(f"Update Msg Error: {e}")
-
-    return JSONResponse(content={"ok": True})
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HANDLER: EVENTS (MESSAGES)
-# ──────────────────────────────────────────────────────────────────────────────
-async def handle_event(req: Request):
-    """Обробляє вхідні повідомлення"""
-    if req.headers.get("X-Slack-Retry-Num"):
-        return JSONResponse(content={"ok": True})
-
-    try:
-        body = await req.body()
-        if not verifier.is_valid_request(body, dict(req.headers)):
-            return JSONResponse(status_code=401, content={"error": "invalid signature"})
-        
-        payload = await req.json()
-    except:
-        return JSONResponse(status_code=400, content={"error": "bad request"})
-
-    if payload.get("type") == "url_verification":
-        return JSONResponse(content={"challenge": payload.get("challenge")})
-
-    event = payload.get("event", {})
-    if not event: return JSONResponse(content={"ok": True})
-
-    # Дедуплікація
-    evt_id = payload.get("event_id")
-    if evt_id in processed_event_ids: return JSONResponse(content={"ok": True})
-    processed_event_ids[evt_id] = True
-
-    if event.get("bot_id"): return JSONResponse(content={"ok": True})
-
-    # Типи подій
-    is_mention = event.get("type") == "app_mention"
-    is_dm = event.get("type") == "message" and event.get("channel_type") == "im"
-
-    if is_mention or is_dm:
-        text = _strip_bot_mention(event.get("text", ""))
-        user = event.get("user")
-        channel = event.get("channel")
-        
-        logger.info(f"Task from {user}: {text}")
-        
-        asyncio.create_task(
-            _respond_async(text, channel, user)
-        )
-
-    return JSONResponse(content={"ok": True})
+# Змінна для сумісності
+semantic_map = get_semantic_map()
