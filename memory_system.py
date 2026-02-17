@@ -73,17 +73,27 @@ def update_rating(query_id, rating):
         print(f"FATAL Rating Update/Merge Error for {query_id}: {e}")
 
 def find_exact_match(user_query):
+    """
+    ### ОНОВЛЕНО ###
+    Шукає точний запит і повертає не тільки SQL, але і ПОВНУ ТЕКСТОВУ ВІДПОВІДЬ.
+    """
     sql = f"""
-        SELECT sql FROM `{BQ_MEMORY_TABLE}`
+        SELECT sql, response_text 
+        FROM `{BQ_MEMORY_TABLE}`
         WHERE rating = 'good' AND LOWER(TRIM(query)) = LOWER(TRIM(@q))
-        ORDER BY timestamp DESC LIMIT 1
+        ORDER BY timestamp DESC 
+        LIMIT 1
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("q", "STRING", user_query)]
     )
     try:
         rows = list(bq_client.query(sql, job_config=job_config).result())
-        if rows: return rows[0].sql
+        if rows:
+            return {
+                "sql": rows[0].sql,
+                "response_text": rows[0].response_text
+            }
     except: pass
     return None
 
@@ -102,19 +112,14 @@ def find_similar_matches(user_query):
 def _learn_semantics(user_query, sql):
     """
     ### ОНОВЛЕНИЙ "МОЗОК" ###
-    AI Агент, який аналізує запит і шукає нові слова з розумним промптом.
+    AI Агент з покращеним промптом для аналізу граматики.
     """
     print(f"🎓 Learning from query: '{user_query}'")
-    
-    # Завантажуємо актуальну карту знань (статика + динаміка з BQ)
     current_map = get_semantic_map()
-    
     model = GenerativeModel("gemini-2.5-flash")
     
-    # Новий, більш детальний промпт
     prompt = f"""
-    You are an AI Analyst tasked with expanding a semantic map.
-    Your goal is to find new synonyms or terms from a user's query that correspond to a value in a generated SQL query, but are not yet in the knowledge base.
+    You are an AI Analyst expanding a semantic map. Your task is to find new synonyms from a user's query that correspond to a value in a SQL query but are not yet in the knowledge base.
 
     **1. Knowledge Base (Current Semantic Map):**
     ```json
@@ -126,38 +131,38 @@ def _learn_semantics(user_query, sql):
     - **Generated SQL:** "{sql}"
 
     **3. Your Task (Step-by-step):**
-    a. **Analyze the SQL:** Identify key filters in the `WHERE` clause. For example, `app_name = 'nibble'` or `geo_country = 'US'`.
-    b. **Analyze the User Query:** Find words or phrases the user said that correspond to these SQL filters. For example, the user might say "небула" which corresponds to `app_name = 'nibble'`.
-    c. **Check the Knowledge Base:** For the mapping you found (e.g., "небула" -> 'nibble'), find the correct key in the map (e.g., `app_name:nibble`). Look at the list of synonyms for that key. Is the user's word ("небула") already in that list?
-    d. **Identify New Terms:** If the user's word is NOT in the list, it's a new term to be learned.
-    e. **Format the Output:** Return a JSON object where the key is the semantic map key and the value is the new synonym.
+    a. **Analyze SQL:** Identify key filters in the `WHERE` clause (e.g., `app_name = 'nibble'`).
+    b. **Analyze User Query:** Find user's words that correspond to these SQL filters (e.g., "нібуле" -> 'nibble').
+    c. **Normalize the Word:** Normalize the user's word to its base form (e.g., "нібуле" -> "нібл"). The user speaks Ukrainian, so consider grammar and declensions.
+    d. **Check Knowledge Base:** Find the correct map key (e.g., `app_name:nibble`). Check if the *normalized* word ("нібл") is already among the synonyms. The existing synonyms might be `["nibble", "nible", "нібл", "ніббл"]`.
+    e. **Identify New Term:** If the normalized word is NOT found, it means the user's original word (e.g., "нібуле") is a new, valuable synonym.
+    f. **Format Output:** Return a JSON object mapping the map key to the *original user's word*.
 
     **Example:**
-    - User Query: "доходи по небулі за 2024"
-    - Generated SQL: "SELECT ... FROM ... WHERE app_name = 'nibble' AND ..."
-    - Your thinking:
-        1. SQL filters by `app_name = 'nibble'`.
-        2. User said "небулі". This seems to correspond to 'nibble'.
-        3. The map key for this is `app_name:nibble`.
-        4. I'll check the list for `app_name:nibble` in the knowledge base. Let's say it is `["nibble", "nible", "нібл", "ніббл"]`.
-        5. The word "небулі" is NOT in this list. It is a new term.
+    - User Query: "доходи по нібуле за 2024"
+    - SQL: "SELECT ... WHERE app_name = 'nibble' ..."
+    - Your logic:
+        1. SQL filter is `app_name = 'nibble'`.
+        2. User said "нібуле".
+        3. Normalized form of "нібуле" is "нібл".
+        4. I'll check the list for `app_name:nibble`. It contains "нібл".
+        5. Since the base form exists, the user's specific declension "нібуле" is also useful to learn for more exact matches. Is "нібуле" in the list? No. It's a new term.
     - **Output:**
     ```json
     {{
-        "app_name:nibble": "небулі"
+        "app_name:nibble": "нібуле"
     }}
     ```
 
     **CRITICAL RULES:**
-    - If you find no new terms, return an empty JSON object: `{{}}`.
-    - Return ONLY the JSON object, nothing else. No markdown, no explanations.
+    - If you find no new terms, return `{{}}`.
+    - Return ONLY the JSON object.
     """
     
     try:
         resp = model.generate_content(prompt, generation_config={"temperature": 0.0})
         text = resp.text.strip().replace("```json", "").replace("```", "")
         
-        # Перевірка на пусту відповідь
         if not text or text == "{}":
             print("🧠 No new terms found to learn.")
             return
@@ -165,8 +170,7 @@ def _learn_semantics(user_query, sql):
         new_terms = json.loads(text)
         if new_terms:
             for key, value in new_terms.items():
-                # Переконуємося, що ми додаємо просту строку
                 if isinstance(value, str):
                     add_term_to_map(key, value)
     except Exception as e:
-        print(f"❌ Learning agent failed: {e}. Response text was: '{text}'")
+        print(f"❌ Learning agent failed: {e}. Response text: '{text}'")
