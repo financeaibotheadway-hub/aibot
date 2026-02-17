@@ -158,6 +158,9 @@ def _needs_breakdown(text: str) -> bool:
     return any(k in t for k in keywords)
 
 def get_cache_key(query: str) -> str:
+    # FIX: Ensure query is a string before encoding
+    if not isinstance(query, str):
+        query = str(query)
     return hashlib.md5(query.encode("utf-8")).hexdigest()
 
 def get_table_schema(table_ref: str, ttl_sec: int = 3600):
@@ -835,7 +838,16 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
         
         if cached_sql:
             logger.info("⚡ FOUND EXACT MATCH IN MEMORY! Re-using SQL.")
-            generated_sql = cached_sql
+            # --- FIX START: Обробка ситуації, коли пам'ять повертає dict ---
+            if isinstance(cached_sql, dict):
+                # Спробуємо дістати SQL з різних ймовірних ключів
+                generated_sql = cached_sql.get("sql_query") or cached_sql.get("sql") or cached_sql.get("query")
+                # Якщо ключів немає, перетворимо на рядок
+                if not generated_sql:
+                    generated_sql = str(cached_sql)
+            else:
+                generated_sql = str(cached_sql)
+            # --- FIX END ---
         else:
             # 3. Шукаємо схожі запити (RAG)
             memory_context = ""
