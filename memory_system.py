@@ -20,48 +20,81 @@ BQ_MEMORY_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.bot_memory"
 bq_client = bigquery.Client(project=BQ_PROJECT)
 
 def log_query_to_memory(user_query, sql, response_text):
-    """Зберігає запит як 'pending'"""
+    """
+    ### ВИПРАВЛЕННЯ ###
+    Зберігає запит як 'pending' за допомогою DML INSERT, а не стрімінгу.
+    Це вирішує проблему "streaming buffer".
+    """
     query_id = str(uuid.uuid4())[:8]
-    row = {
-        "id": query_id,
-        "timestamp": datetime.now().isoformat(),
-        "query": user_query.strip(),
-        "sql": sql,
-        "response_text": response_text[:50000],
-        "rating": None
-    }
+    
+    insert_sql = f"""
+        INSERT INTO `{BQ_MEMORY_TABLE}` (id, timestamp, query, sql, response_text, rating)
+        VALUES (@id, @ts, @query, @sql, @response, NULL)
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("id", "STRING", query_id),
+            bigquery.ScalarQueryParameter("ts", "TIMESTAMP", datetime.now().isoformat()),
+            bigquery.ScalarQueryParameter("query", "STRING", user_query.strip()),
+            bigquery.ScalarQueryParameter("sql", "STRING", sql),
+            bigquery.ScalarQueryParameter("response", "STRING", response_text[:50000]),
+        ]
+    )
+    
     try:
-        bq_client.insert_rows_json(BQ_MEMORY_TABLE, [row])
+        query_job = bq_client.query(insert_sql, job_config=job_config)
+        query_job.result() # Чекаємо завершення
+        if query_job.errors:
+            print(f"Memory Log DML Error: {query_job.errors}")
     except Exception as e:
-        print(f"Memory Log Error: {e}")
+        print(f"Memory Log DML Exception: {e}")
+        
     return query_id
 
 def update_rating(query_id, rating):
     """
-    Оновлює оцінку. Якщо Good -> запускає навчання.
+    Оновлює оцінку за допомогою MERGE. Тепер це буде працювати,
+    оскільки початковий запис теж був DML.
     """
-    update_sql = f"UPDATE `{BQ_MEMORY_TABLE}` SET rating = @rating WHERE id = @id"
+    print(f"Attempting to MERGE rating for {query_id} to '{rating}'...")
+    
+    merge_sql = f"""
+        MERGE `{BQ_MEMORY_TABLE}` T
+        USING (SELECT @id AS id) S ON T.id = S.id
+        WHEN MATCHED THEN
+          UPDATE SET rating = @rating
+    """
+    
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("rating", "STRING", rating),
             bigquery.ScalarQueryParameter("id", "STRING", query_id)
         ]
     )
+    
     try:
-        bq_client.query(update_sql, job_config=job_config).result()
-        print(f"⭐️ Rated {query_id}: {rating}")
+        query_job = bq_client.query(merge_sql, job_config=job_config)
+        query_job.result()
+
+        if query_job.errors:
+            print(f"❌ BQ MERGE Job Error for {query_id}: {query_job.errors}")
+            return
+
+        print(f"⭐️ Rated {query_id}: {rating} successfully.")
         
         if rating == "good":
-            # Тягнемо дані для навчання
             sel_sql = f"SELECT query, sql FROM `{BQ_MEMORY_TABLE}` WHERE id = @id LIMIT 1"
             rows = list(bq_client.query(sel_sql, job_config=job_config).result())
             if rows:
                 _learn_semantics(rows[0].query, rows[0].sql)
+                
     except Exception as e:
-        print(f"Rating Update Error: {e}")
+        print(f"FATAL Rating Update/Merge Error for {query_id}: {e}")
+
+# --- (решта файлу без змін) ---
 
 def find_exact_match(user_query):
-    """Перевіряє, чи є такий успішний запит в базі"""
     sql = f"""
         SELECT sql FROM `{BQ_MEMORY_TABLE}`
         WHERE rating = 'good' AND LOWER(TRIM(query)) = LOWER(TRIM(@q))
@@ -77,9 +110,7 @@ def find_exact_match(user_query):
     return None
 
 def find_similar_matches(user_query):
-    """Шукає схожі запити (Top-3)"""
     try:
-        # Беремо останні 500 успішних і фільтруємо в Python (швидше і дешевше)
         sql = f"SELECT query, sql FROM `{BQ_MEMORY_TABLE}` WHERE rating = 'good' ORDER BY timestamp DESC LIMIT 500"
         rows = list(bq_client.query(sql).result())
         
@@ -93,7 +124,6 @@ def find_similar_matches(user_query):
     except: return ""
 
 def _learn_semantics(user_query, sql):
-    """AI Агент: шукає нові слова і пише їх в мапу"""
     print(f"🎓 Learning from: {user_query}")
     current_map = get_semantic_map()
     model = GenerativeModel("gemini-2.5-flash")
