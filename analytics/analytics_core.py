@@ -683,6 +683,7 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо користувач питає "скільки чарджбеків/рефандів/підписок" (кількість подій, а не сума грошей):
      використовуй `COUNT(*)` або `COUNT(1)`.
    - НЕ використовуй `SUM(amount)` для кількості.
+   - НЕ використовуй `SUM(amount)` для кількості.
    - НЕ використовуй `COUNT(DISTINCT ...)`, якщо не просять "унікальних".
    - Кожен рядок в таблиці = 1 подія.
 
@@ -765,6 +766,10 @@ COST: {json.dumps(cost_schema, indent=2)}
         if event_type:
             # Якщо це запит на виключення, не додаємо жорсткий фільтр
             if not skip_event_filter:
+                # 🔥 FIX: Видаляємо конфліктуючі фільтри, які міг вигадати AI
+                # Наприклад, якщо AI написав "WHERE event_type = 'chargeback'", а ми знайшли keyword "commission"
+                sql = re.sub(r"\bevent_type\s*=\s*['\"][^'\"]+['\"]", "1=1", sql, flags=re.IGNORECASE)
+                
                 if f"event_type = '{event_type}'" not in sql.lower():
                     sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
