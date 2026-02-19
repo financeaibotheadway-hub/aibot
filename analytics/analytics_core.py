@@ -683,7 +683,6 @@ COST: {json.dumps(cost_schema, indent=2)}
    - Якщо користувач питає "скільки чарджбеків/рефандів/підписок" (кількість подій, а не сума грошей):
      використовуй `COUNT(*)` або `COUNT(1)`.
    - НЕ використовуй `SUM(amount)` для кількості.
-   - НЕ використовуй `SUM(amount)` для кількості.
    - НЕ використовуй `COUNT(DISTINCT ...)`, якщо не просять "унікальних".
    - Кожен рядок в таблиці = 1 подія.
 
@@ -766,12 +765,30 @@ COST: {json.dumps(cost_schema, indent=2)}
         if event_type:
             # Якщо це запит на виключення, не додаємо жорсткий фільтр
             if not skip_event_filter:
-                # 🔥 FIX: Видаляємо конфліктуючі фільтри, які міг вигадати AI
-                # Наприклад, якщо AI написав "WHERE event_type = 'chargeback'", а ми знайшли keyword "commission"
-                sql = re.sub(r"\bevent_type\s*=\s*['\"][^'\"]+['\"]", "1=1", sql, flags=re.IGNORECASE)
+                # 🔥 FIX (CRITICAL): Replace conflicting filters with "1=1" to preserve SQL structure
+                # Handles simple 'event_type =', backticked `event_type` =, and TRIM/LOWER combinations
                 
+                # Pattern for: (anything) event_type (anything) = 'value'
+                # e.g. "WHERE event_type = 'val'", "AND `event_type` = 'val'", "AND TRIM(event_type) = 'val'"
+                
+                # This regex looks for:
+                # 1. Start of column part (event_type or with wrappers)
+                # 2. Equality operator
+                # 3. Quoted value
+                
+                # We replace the whole condition with " 1=1 "
+                # The lookbehind (?<=...) is hard in Python for variable length, so we use re.sub on the matches
+                
+                # Simple case: event_type = '...'
+                sql = re.sub(r"\b`?event_type`?\s*=\s*['\"][^'\"]+['\"]", " 1=1 ", sql, flags=re.IGNORECASE)
+                
+                # Complex case: TRIM(LOWER(event_type)) = '...'
+                sql = re.sub(r"\bTRIM\s*\(\s*LOWER\s*\(\s*`?event_type`?\s*\)\s*\)\s*=\s*['\"][^'\"]+['\"]", " 1=1 ", sql, flags=re.IGNORECASE)
+                
+                # Ensure the correct filter is present
                 if f"event_type = '{event_type}'" not in sql.lower():
                     sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+                    
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
