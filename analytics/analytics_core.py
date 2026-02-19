@@ -27,7 +27,13 @@ except ImportError:
     def log_query_to_memory(q, s, r): return None
     def find_exact_match(q): return None
     def find_similar_matches(q): return ""
-    from semantic_map import semantic_map as get_semantic_map # fallback to var if func missing
+    
+    # FIX: Handle semantic_map import correctly as a function
+    try:
+        from semantic_map import semantic_map
+        def get_semantic_map(): return semantic_map
+    except ImportError:
+        def get_semantic_map(): return {}
 # <<<
 
 # >>>>>>>>>>>> INTEGRATION (NEW)
@@ -765,32 +771,38 @@ COST: {json.dumps(cost_schema, indent=2)}
         if event_type:
             # Якщо це запит на виключення, не додаємо жорсткий фільтр
             if not skip_event_filter:
-                # 🔥 FIX (CRITICAL): Replace conflicting filters with "1=1" to preserve SQL structure
-                # Handles simple 'event_type =', backticked `event_type` =, and TRIM/LOWER combinations
+                # 🔥 FIX (SMARTER CLEANUP):
+                # 1. Якщо ми точно визначили намір (наприклад "комісія"), 
+                #    ми повинні ОБОВ'ЯЗКОВО прибрати будь-які інші фільтри по event_type, 
+                #    які міг згенерувати AI (наприклад, AI помилково написав 'chargeback').
+                # 2. Тільки після цього додаємо правильний фільтр.
                 
-                # Pattern for: (anything) event_type (anything) = 'value'
-                # e.g. "WHERE event_type = 'val'", "AND `event_type` = 'val'", "AND TRIM(event_type) = 'val'"
+                # Remove complex: TRIM(LOWER(event_type)) = '...'
+                sql = re.sub(
+                    r"TRIM\s*\(\s*LOWER\s*\(\s*`?event_type`?\s*\)\s*\)\s*=\s*['\"][^'\"]+['\"]", 
+                    " 1=1 ", 
+                    sql, 
+                    flags=re.IGNORECASE
+                )
                 
-                # This regex looks for:
-                # 1. Start of column part (event_type or with wrappers)
-                # 2. Equality operator
-                # 3. Quoted value
+                # Remove simple: event_type = '...'
+                sql = re.sub(
+                    r"\b`?event_type`?\s*=\s*['\"][^'\"]+['\"]", 
+                    " 1=1 ", 
+                    sql, 
+                    flags=re.IGNORECASE
+                )
                 
-                # We replace the whole condition with " 1=1 "
-                # The lookbehind (?<=...) is hard in Python for variable length, so we use re.sub on the matches
+                # Тепер додаємо правильний фільтр
+                robust_condition = f"TRIM(LOWER(event_type)) = '{event_type}'"
                 
-                # Simple case: event_type = '...'
-                sql = re.sub(r"\b`?event_type`?\s*=\s*['\"][^'\"]+['\"]", " 1=1 ", sql, flags=re.IGNORECASE)
-                
-                # Complex case: TRIM(LOWER(event_type)) = '...'
-                sql = re.sub(r"\bTRIM\s*\(\s*LOWER\s*\(\s*`?event_type`?\s*\)\s*\)\s*=\s*['\"][^'\"]+['\"]", " 1=1 ", sql, flags=re.IGNORECASE)
-                
-                # Ensure the correct filter is present
-                if f"event_type = '{event_type}'" not in sql.lower():
-                    sql = _ensure_where_filter(sql, f"event_type = '{event_type}'")
+                # Перевіряємо, чи немає його вже (малоймовірно після чистки, але для надійності)
+                if robust_condition.lower() not in sql.lower():
+                     sql = _ensure_where_filter(sql, robust_condition)
                     
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
-            sql = _ensure_where_filter(sql, "event_type = 'sale'")
+            if "'sale'" not in sql.lower():
+                sql = _ensure_where_filter(sql, "event_type = 'sale'")
 
     if account_no is not None:
         sql = _ensure_where_filter(sql, f"account_no = {account_no}")
