@@ -62,14 +62,49 @@ def _strip_bot_mention(text: str) -> str:
         text = re.sub(r"^<@[\w]+>\s*", "", text)
     return text.strip()
 
-def _get_feedback_blocks(text, query_id):
-    """Генерує блоки Slack з кнопками"""
-    return [
-        {
+# ### НОВА ФУНКЦІЯ: Динамічне створення блоків ###
+def _create_dynamic_blocks(text, query_id):
+    """
+    Створює масив блоків для Slack.
+    Якщо текст довший за 3000 символів, він розбивається на кілька блоків.
+    """
+    SLACK_TEXT_BLOCK_LIMIT = 2900  # Ліміт тексту в одному блоці (з запасом)
+    
+    blocks = []
+    
+    # Якщо текст короткий, створюємо один блок
+    if len(text) <= SLACK_TEXT_BLOCK_LIMIT:
+        blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": text}
-        },
-        {
+        })
+    # Якщо текст довгий, нарізаємо його на частини
+    else:
+        # Розбиваємо по параграфах (подвійний перенос рядка)
+        paragraphs = text.split('\n\n')
+        current_chunk = ""
+        for p in paragraphs:
+            # Якщо наступний параграф не влазить, зберігаємо поточний чанк
+            if len(current_chunk) + len(p) + 2 > SLACK_TEXT_BLOCK_LIMIT:
+                if current_chunk.strip():
+                    blocks.append({
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": current_chunk.strip()}
+                    })
+                current_chunk = ""
+            
+            current_chunk += p + "\n\n"
+        
+        # Додаємо останній шматок, якщо він залишився
+        if current_chunk.strip():
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": current_chunk.strip()}
+            })
+
+    # В кінці ЗАВЖДИ додаємо блок з кнопками, якщо є query_id
+    if query_id:
+        blocks.append({
             "type": "actions",
             "block_id": f"feedback_{query_id}",
             "elements": [
@@ -88,15 +123,16 @@ def _get_feedback_blocks(text, query_id):
                     "action_id": "vote_bad"
                 }
             ]
-        }
-    ]
+        })
+        
+    return blocks
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CORE LOGIC: RESPONDER
 # ──────────────────────────────────────────────────────────────────────────────
 async def _respond_async(user_text: str, source_channel: str, user_id: str):
     """
-    Генерує відповідь (з кнопками, якщо це аналітика) і відправляє в DM.
+    Генерує відповідь і відправляє в DM, використовуючи динамічні блоки.
     """
     try:
         result = await asyncio.to_thread(
@@ -106,54 +142,48 @@ async def _respond_async(user_text: str, source_channel: str, user_id: str):
         )
         
         if isinstance(result, dict):
-            response_text = result.get("text", "")
+            response_text = result.get("text", "An error occurred during analysis.")
             query_id = result.get("query_id")
         else:
             response_text = str(result)
             query_id = None
 
     except Exception as e:
-        logger.exception("Error in analysis")
-        response_text = f"❌ Error processing request: {str(e)}"
+        logger.exception("Error in run_analysis task")
+        response_text = f"❌ An internal error occurred: {str(e)}"
         query_id = None
 
     target_dm_id = await _get_dm_channel_id(user_id)
     if not target_dm_id:
-        target_dm_id = source_channel 
+        target_dm_id = source_channel # Fallback to original channel
 
     is_source_dm = source_channel.startswith("D")
 
-    # 🔥 FIX ДЛЯ ДОВГИХ ПОВІДОМЛЕНЬ 🔥
-    # Slack Blocks мають ліміт 3000 символів. Якщо більше - шлемо просто текстом.
-    try:
-        if len(response_text) > 2900:
-            logger.warning("Response too long for blocks (buttons), sending as plain text.")
-            # Відправляємо просто текст (до 40 000 символів), але без кнопок
-            await client.chat_postMessage(channel=target_dm_id, text=response_text)
-        
-        elif query_id:
-            # Якщо влазить в ліміт - додаємо кнопки
-            blocks = _get_feedback_blocks(response_text, query_id)
-            await client.chat_postMessage(channel=target_dm_id, text=response_text, blocks=blocks)
-        
-        else:
-            # Звичайна відповідь
-            await client.chat_postMessage(channel=target_dm_id, text=response_text)
-            
-    except Exception as e:
-        logger.error(f"Send Error: {e}")
-        # Спроба відправити хоча б помилку юзеру
-        try:
-            await client.chat_postMessage(channel=target_dm_id, text=f"⚠️ Error sending full response: {e}")
-        except: pass
+    # ### ОНОВЛЕНО: Використовуємо нову функцію для створення блоків ###
+    blocks = _create_dynamic_blocks(response_text, query_id)
 
-    # Повідомлення в публічному каналі
+    try:
+        # Відправляємо масив блоків. Slack сам їх відобразить.
+        await client.chat_postMessage(
+            channel=target_dm_id, 
+            text=response_text[:3000], # Fallback text для нотифікацій
+            blocks=blocks
+        )
+    except Exception as e:
+        logger.error(f"Failed to send block response: {e}")
+        # Якщо блоки не спрацювали, пробуємо відправити просто текст
+        try:
+            await client.chat_postMessage(channel=target_dm_id, text=response_text)
+        except Exception as e2:
+             logger.error(f"Failed to send plain text fallback: {e2}")
+
+    # Повідомлення в публічному каналі, якщо запит був звідти
     if not is_source_dm and source_channel != target_dm_id:
         try:
             await client.chat_postEphemeral(
                 channel=source_channel,
                 user=user_id,
-                text="📩 Answer sent to DM."
+                text="📩 I've sent the answer to your Direct Messages."
             )
         except: pass
 
@@ -187,47 +217,39 @@ async def handle_interactive(req: Request, payload_str: str):
 
     rating = "good" if action_id == "vote_good" else "bad"
     
-    # Спроба запису в БД (ігноруємо помилки прав доступу, щоб не було 500)
     if query_id and query_id != "None":
-        try:
-            await asyncio.to_thread(update_rating, query_id, rating)
-            logger.info(f"Rating updated: {rating}")
-        except Exception as e:
-            logger.error(f"Failed to update rating (DB error): {e}")
+        # Запускаємо оновлення рейтингу у фоні
+        asyncio.create_task(
+            asyncio.to_thread(update_rating, query_id, rating)
+        )
+        logger.info(f"Scheduled rating update for {query_id}: {rating}")
 
-    # Оновлення повідомлення
+    # Оновлення повідомлення в Slack
     footer = "✅ Thanks! I'll remember this." if rating == "good" else "❌ Thanks for feedback."
     
-    # Беремо оригінальний текст (перший блок), якщо він є
     original_blocks = message_data.get("blocks", [])
     new_blocks = []
     
-    # Якщо оригінальне повідомлення було блоками
-    if original_blocks:
-        new_blocks.append(original_blocks[0])
-        new_blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": footer}]
-        })
-        try:
-            await client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                blocks=new_blocks,
-                text="Feedback received"
-            )
-        except Exception as e:
-            logger.error(f"Update Msg Error: {e}")
-    else:
-        # Якщо оригінал був plain text (через ліміт), ми не можемо його оновити на блоки легко
-        # Просто постимо ephemeral підтвердження
-        try:
-            await client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_data.get("id"),
-                text=footer
-            )
-        except: pass
+    # Збираємо всі текстові блоки, крім останнього (де були кнопки)
+    for block in original_blocks:
+        if block.get("type") != "actions":
+            new_blocks.append(block)
+    
+    # Додаємо новий футер
+    new_blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": footer}]
+    })
+    
+    try:
+        await client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            blocks=new_blocks,
+            text="Feedback received"
+        )
+    except Exception as e:
+        logger.error(f"Update Msg Error: {e}")
 
     return JSONResponse(content={"ok": True})
 
@@ -267,7 +289,6 @@ async def handle_event(req: Request):
         user = event.get("user")
         channel = event.get("channel")
 
-        # 🔥 FIX: Ігноруємо події без юзера (щоб не було помилок в логах)
         if not user:
             logger.warning(f"Skipping event with no user. Event type: {event.get('type')}")
             return JSONResponse(content={"ok": True})
