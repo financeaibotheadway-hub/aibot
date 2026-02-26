@@ -1,3 +1,4 @@
+ 
 # analytics/analytics_core.py
 # -*- coding: utf-8 -*-
 
@@ -18,23 +19,44 @@ from google.api_core.exceptions import BadRequest, GoogleAPIError, NotFound
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
 
-# >>> INTEGRATION: MEMORY & SEMANTICS
+# ──────────────────────────────────────────────────────────────────────────────
+# SAFE IMPORT BLOCK & INTEGRATION STUBS
+# ──────────────────────────────────────────────────────────────────────────────
+# Цей блок гарантує, що код не впаде "мовчки", якщо модулі пам'яті відсутні
+# або виникає помилка цилічного імпорту.
+
+# 1. Спочатку визначаємо заглушки (Safe defaults)
+def _stub_log(q, s, r): return None
+def _stub_exact(q): return None
+def _stub_similar(q): return ""
+def _stub_get_map(): return {}
+
+log_query_to_memory = _stub_log
+find_exact_match = _stub_exact
+find_similar_matches = _stub_similar
+get_semantic_map = _stub_get_map
+
+# 2. Спроба реального імпорту Memory System
 try:
     from memory_system import log_query_to_memory, find_exact_match, find_similar_matches
-    from semantic_map import get_semantic_map
 except ImportError:
-    # Fallback stubs needed for local testing without full setup
-    def log_query_to_memory(q, s, r): return None
-    def find_exact_match(q): return None
-    def find_similar_matches(q): return ""
-    
-    # FIX: Handle semantic_map import correctly as a function
+    # Лише логуємо, але не падаємо
+    # logger.warning("⚠️ Memory system not found. Using default stubs.")
+    pass
+
+# 3. Спроба реального імпорту Semantic Map
+try:
+    # Спробуємо імпортувати як функцію
+    from semantic_map import get_semantic_map as _real_get_map
+    get_semantic_map = _real_get_map
+except ImportError:
     try:
-        from semantic_map import semantic_map
-        def get_semantic_map(): return semantic_map
+        # Fallback: якщо це змінна, обгортаємо її у функцію
+        from semantic_map import semantic_map as _map_dict
+        def get_semantic_map(): return _map_dict
     except ImportError:
-        def get_semantic_map(): return {}
-# <<<
+        # logger.warning("⚠️ Semantic map not found. Using empty dict.")
+        pass
 
 # >>>>>>>>>>>> INTEGRATION (NEW)
 from analytics.metric_loader import get_metrics
@@ -110,27 +132,26 @@ def extract_account_no(text: str) -> int | None:
         return int(m.group(1))
     return None
 
-
+# 🔥 FIX: Розширений список для відмінків (використовуємо корені слів)
 EVENT_TYPE_BY_INTENT = {
     "trial": "trial",
     "тріал": "trial",
     "subscription": "sale",
     "subscriptions": "sale",
-    "підписк": "sale", 
-    "підписка": "sale",
-    "підписок": "sale",
-    "підписки": "sale",
+    "підписк": "sale",  # корінь для підписка, підписки, підписок
+    "підпис": "sale",   # ще коротший корінь
     "purchase": "sale",
-    "покупка": "sale",
+    "покупк": "sale",   # корінь для покупка, покупки
     "vat": "vat",
     "tax": "vat",
     "refund": "refund",
-    "refunds": "refund",
-    "повернення": "refund",
+    "рефанд": "refund",     # Корінь
+    "повернен": "refund",   # Корінь
     "chargeback": "chargeback",
     "чарджбек": "chargeback",
+    "чарджб": "chargeback", # Корінь (чарджбек, чарджбеків)
     "commission": "commission",
-    "комісія": "commission",
+    "комісі": "commission", # Корінь (комісія, комісій, комісію)
 }
 
 def extract_year(text: str) -> int | None:
@@ -143,7 +164,11 @@ def extract_year(text: str) -> int | None:
 
 def detect_event_type(text: str) -> str | None:
     text = text.lower()
-    for keyword, event_type in EVENT_TYPE_BY_INTENT.items():
+    # Сортуємо за довжиною ключа (спадання), щоб спочатку шукати довші фрази
+    # Це допомагає уникнути помилкових спрацьовувань коротких коренів
+    sorted_keywords = sorted(EVENT_TYPE_BY_INTENT.items(), key=lambda x: -len(x[0]))
+    
+    for keyword, event_type in sorted_keywords:
         if keyword in text:
             return event_type
     return None
@@ -555,7 +580,16 @@ def split_into_separate_queries(message: str) -> list:
 # ──────────────────────────────────────────────────────────────────────────────
 # SQL GENERATOR
 # ──────────────────────────────────────────────────────────────────────────────
-def generate_sql(instruction_part: str, smap) -> str:
+def generate_sql(instruction_part: str, smap, semantic_overrides=None) -> str:
+    """
+    Generates SQL based on instruction.
+    PRIORITY OF EVENT_TYPE DETECTION:
+    1. Semantic Map Overrides (highest) - if matched by 'find_matches_with_ai'
+    2. Rule-based detection (detect_event_type via regex stems)
+    3. AI Generation (fallback)
+    """
+    logger.info(f"Generating SQL for: {instruction_part}")
+    
     today_str = datetime.now().strftime('%Y-%m-%d')   
     account_no = extract_account_no(instruction_part)
     year = extract_year(instruction_part)
@@ -694,8 +728,13 @@ COST: {json.dumps(cost_schema, indent=2)}
 
 15. EVENT TYPES (CRITICAL):
    - **Допустимі типи:** `sale`, `trial`, `vat`, `wht`, `refund`, `refund_fee`, `chargeback`, `chargeback_fee`, `commission`.
-   - Якщо питання про "чарджбеки" -> `WHERE event_type = 'chargeback'`.
-   - Якщо питання про "рефанди" -> `WHERE event_type = 'refund'`.
+   - ⚠️ НЕ додавай фільтр `event_type`, якщо користувач НЕ просив про конкретний тип.
+   - ⚠️ ЯКЩО користувач просить ("subscriptions", "trials", "commissions", "refunds"), ТОДІ додай:
+     `TRIM(LOWER(event_type)) = 'sale'` (для subscriptions)
+     `TRIM(LOWER(event_type)) = 'trial'`
+     `TRIM(LOWER(event_type)) = 'commission'`
+     `TRIM(LOWER(event_type)) = 'refund'`
+   - Якщо просто "revenue" -> не фільтруй event_type.
    
 16. УТОЧНЕННЯ ДЛЯ AI-АНАЛІТИКА (ВАЖЛИВО):
    - Якщо в результатах SQL немає колонки дати (наприклад, через GROUP BY), але користувач просив конкретний рік/період:
@@ -766,39 +805,42 @@ COST: {json.dumps(cost_schema, indent=2)}
     if re.search(r"\b(без|крім|exclude|excluding|without|виключити|прибрати|net)\b", instruction_part.lower()):
         skip_event_filter = True
 
-    event_type = detect_event_type(instruction_part)
+    # 🔥 FIX: Priority Logic for Event Type
+    # Priority 1: Semantic Map (if 'event_type' was found by AI semantic search)
+    event_type = None
+    
+    # Check override from semantic map first
+    if semantic_overrides:
+        for field, value in semantic_overrides:
+            if field == 'event_type':
+                event_type = value
+                logger.info(f"🎯 Using SEMANTIC MAP override for event_type: {event_type}")
+                break
+    
+    # Priority 2: Keyword Stems (if no semantic override)
+    if not event_type:
+        event_type = detect_event_type(instruction_part)
+        if event_type:
+            logger.info(f"🔎 Using KEYWORD STEM detection for event_type: {event_type}")
+
     if _schema_has_column(rev_schema, "event_type"):
         if event_type:
             # Якщо це запит на виключення, не додаємо жорсткий фільтр
             if not skip_event_filter:
-                # 🔥 FIX (SMARTER CLEANUP):
-                # 1. Якщо ми точно визначили намір (наприклад "комісія"), 
-                #    ми повинні ОБОВ'ЯЗКОВО прибрати будь-які інші фільтри по event_type, 
-                #    які міг згенерувати AI (наприклад, AI помилково написав 'chargeback').
-                # 2. Тільки після цього додаємо правильний фільтр.
+                # 🔥 FIX (AGGRESSIVE CLEANUP):
+                # Using a broad regex to match ANY variation of event_type filtering generated by AI
+                # Matches: event_type = 'x', `event_type`='x', TRIM(LOWER(event_type))='x', etc.
                 
-                # Remove complex: TRIM(LOWER(event_type)) = '...'
-                sql = re.sub(
-                    r"TRIM\s*\(\s*LOWER\s*\(\s*`?event_type`?\s*\)\s*\)\s*=\s*['\"][^'\"]+['\"]", 
-                    " 1=1 ", 
-                    sql, 
-                    flags=re.IGNORECASE
-                )
+                pattern = r"(?:\bTRIM\s*\(\s*)?(?:\bLOWER\s*\(\s*)?`?event_type`?(?:\s*\))?(?:\s*\))?\s*=\s*['\"][^'\"]+['\"]"
                 
-                # Remove simple: event_type = '...'
-                sql = re.sub(
-                    r"\b`?event_type`?\s*=\s*['\"][^'\"]+['\"]", 
-                    " 1=1 ", 
-                    sql, 
-                    flags=re.IGNORECASE
-                )
+                # Nuke existing filters to 1=1 (removes hallucinated chargebacks)
+                sql = re.sub(pattern, " 1=1 ", sql, flags=re.IGNORECASE)
                 
-                # Тепер додаємо правильний фільтр
+                # Inject the correct one determined by Semantic Map or Stems
                 robust_condition = f"TRIM(LOWER(event_type)) = '{event_type}'"
                 
-                # Перевіряємо, чи немає його вже (малоймовірно після чистки, але для надійності)
-                if robust_condition.lower() not in sql.lower():
-                     sql = _ensure_where_filter(sql, robust_condition)
+                # We append it safely
+                sql = _ensure_where_filter(sql, robust_condition)
                     
         elif metric in {"subscriptions", "subscription", "count_subscriptions"}:
             if "'sale'" not in sql.lower():
@@ -827,6 +869,7 @@ COST: {json.dumps(cost_schema, indent=2)}
 # EXECUTE SINGLE QUERY (INTEGRATED FIX & LOGGING)
 # ──────────────────────────────────────────────────────────────────────────────
 def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown"):
+    logger.info(f"👉 EXECUTE QUERY: {instruction} (User: {user_id})")
     start_time = time.time()
     instruction_part = instruction.strip()
     
@@ -891,7 +934,9 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 pass
             
             # 4. Формуємо промпт з контекстом
+            # 🔥 FIX: Capture matched fields from Semantic Map to pass as overrides
             matched = find_matches_with_ai(instruction_part, full_smap)
+            
             augmented_instruction = instruction_part
             for field, value in matched:
                 augmented_instruction += f" ({field}='{value}')"
@@ -900,7 +945,8 @@ def execute_single_query(instruction: str, smap: dict, user_id: str = "unknown")
                 augmented_instruction += f"\n\n[INTERNAL MEMORY - PREVIOUS CORRECT EXAMPLES]:\n{memory_context}\n"
 
             # 5. Генеруємо SQL
-            generated_sql = generate_sql(augmented_instruction, full_smap)
+            # 🔥 FIX: Pass matched semantic fields as overrides
+            generated_sql = generate_sql(augmented_instruction, full_smap, semantic_overrides=matched)
         # <<< MEMORY LOGIC END
 
         # === ВИКОНАННЯ ЗАПИТУ ===
@@ -1065,6 +1111,7 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
     except Exception as e:
         status = "ERROR"
         error_details = str(e)
+        logger.error(f"❌ EXECUTION ERROR: {traceback.format_exc()}")
         
         # Обробка лімітів токенів
         if any(k in str(error_details).lower() for k in ["429", "exhausted", "token", "quota"]):
@@ -1110,29 +1157,38 @@ SQL запит повернув ОДНЕ значення/рядок. Це і є
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MAIN ENTRY POINTS
+# MAIN ENTRY POINTS (WRAPPED FOR SAFETY)
 # ──────────────────────────────────────────────────────────────────────────────
 def process_slack_message(message: str, smap: dict, user_id: str = "unknown"):
-    queries = split_into_separate_queries(message)
-    # Фільтрація пустих запитів
-    queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
+    try:
+        queries = split_into_separate_queries(message)
+        # Фільтрація пустих запитів
+        queries = [q for q in queries if q.strip() and len(q.strip()) > 2]
 
-    if not queries:
-        return {"text": "Не вдалося розпізнати запит.", "query_id": None}
+        if not queries:
+            return {"text": "Не вдалося розпізнати запит.", "query_id": None}
 
-    # Якщо один запит - повертаємо результат як є (dict з query_id)
-    if len(queries) == 1:
-        return execute_single_query(queries[0], smap, user_id)
-        
-    # Якщо декілька - комбінуємо текст, але кнопки не додаємо (складно для UI)
-    combined_text = f"📝 Знайдено {len(queries)} запитів:\n\n"
-    for i, q in enumerate(queries, 1):
-        result = execute_single_query(q, smap, user_id)
-        ans = result["text"]
-        combined_text += f"**Запит {i}:** {q}\n{ans}\n\n"
-        
-    return {"text": combined_text, "query_id": None}
+        # Якщо один запит - повертаємо результат як є (dict з query_id)
+        if len(queries) == 1:
+            return execute_single_query(queries[0], smap, user_id)
+            
+        # Якщо декілька - комбінуємо текст, але кнопки не додаємо (складно для UI)
+        combined_text = f"📝 Знайдено {len(queries)} запитів:\n\n"
+        for i, q in enumerate(queries, 1):
+            result = execute_single_query(q, smap, user_id)
+            ans = result["text"]
+            combined_text += f"**Запит {i}:** {q}\n{ans}\n\n"
+            
+        return {"text": combined_text, "query_id": None}
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR in process_slack_message: {traceback.format_exc()}")
+        return {"text": f"❌ Критична помилка бота: {str(e)}", "query_id": None}
 
 def run_analysis(message: str, semantic_map_override=None, user_id="unknown"):
-    smap = semantic_map_override or get_semantic_map()
-    return process_slack_message(message, smap, user_id)
+    try:
+        logger.info(f"🚀 RUN ANALYSIS START: {message} (User: {user_id})")
+        smap = semantic_map_override or get_semantic_map()
+        return process_slack_message(message, smap, user_id)
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR in run_analysis: {traceback.format_exc()}")
+        return {"text": f"❌ Критична помилка запуску: {str(e)}", "query_id": None}
